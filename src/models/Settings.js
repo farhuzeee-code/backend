@@ -55,6 +55,10 @@ const settingsSchema = new mongoose.Schema(
       min: [5, 'Call duration limit must be at least 5 minutes'],
       max: [720, 'Call duration limit cannot exceed 12 hours'],
     },
+    genderFilterRequiresPro: {
+      type: Boolean,
+      default: false,
+    },
     subscriptionPlan: {
       type: subscriptionPlanSchema,
       default: () => ({}),

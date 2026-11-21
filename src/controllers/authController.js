@@ -75,6 +75,7 @@ export const signup = async (req, res, next) => {
         email: user.email,
         role: user.role,
         status: user.status,
+        gender: user.gender || 'unspecified',
         avatar: user.avatar,
         createdAt: user.createdAt,
       },
@@ -138,6 +139,7 @@ export const login = async (req, res, next) => {
         email: user.email,
         role: user.role,
         status: user.status,
+        gender: user.gender || 'unspecified',
         avatar: user.avatar,
         createdAt: user.createdAt,
       },
@@ -166,7 +168,7 @@ export const getMe = async (req, res) => {
  */
 export const updateProfile = async (req, res, next) => {
   try {
-    const { name, avatar } = req.body;
+    const { name, avatar, gender } = req.body;
     const user = await User.findById(req.user._id);
 
     if (!user) {
@@ -175,6 +177,9 @@ export const updateProfile = async (req, res, next) => {
 
     if (name) user.name = name.trim();
     if (avatar !== undefined) user.avatar = avatar;
+    if (gender && ['male', 'female', 'other', 'unspecified'].includes(gender)) {
+      user.gender = gender;
+    }
 
     await user.save();
 
@@ -187,6 +192,7 @@ export const updateProfile = async (req, res, next) => {
         email: user.email,
         role: user.role,
         status: user.status,
+        gender: user.gender,
         avatar: user.avatar,
       },
     });
@@ -194,4 +200,50 @@ export const updateProfile = async (req, res, next) => {
     next(error);
   }
 };
+
+/**
+ * @desc    Instant 1-click Guest Login
+ * @route   POST /api/auth/guest
+ * @access  Public
+ */
+export const guestLogin = async (req, res, next) => {
+  try {
+    const { name, gender } = req.body;
+    const randomSuffix = Math.floor(1000 + Math.random() * 9000);
+    const guestName = name && name.trim() ? name.trim().slice(0, 24) : `User_${randomSuffix}`;
+    const guestGender = ['male', 'female', 'other'].includes(gender) ? gender : 'unspecified';
+    const guestEmail = `guest_${Date.now()}_${randomSuffix}@guest.aqeleo.cfd`;
+    const passwordHash = await User.hashPassword(`GuestSecret#${randomSuffix}Aq`);
+
+    const user = await User.create({
+      name: guestName,
+      email: guestEmail,
+      passwordHash,
+      role: 'user',
+      status: 'active',
+      gender: guestGender,
+      avatar: `https://api.dicebear.com/7.x/bottts/svg?seed=${guestName}`,
+    });
+
+    const token = generateToken(user._id, user.role);
+
+    res.json({
+      success: true,
+      token,
+      user: {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        status: user.status,
+        gender: user.gender,
+        avatar: user.avatar,
+        isGuest: true,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 

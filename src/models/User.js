@@ -63,6 +63,11 @@ const userSchema = new mongoose.Schema(
       enum: ['active', 'suspended'],
       default: 'active',
     },
+    gender: {
+      type: String,
+      enum: ['male', 'female', 'other', 'unspecified'],
+      default: 'unspecified',
+    },
     avatar: {
       type: String,
       default: '',

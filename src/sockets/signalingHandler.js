@@ -1,40 +1,202 @@
 import { Call } from '../models/Call.js';
 import { roomStore } from './roomStore.js';
+import { matchmaker } from './matchmaker.js';
 
 /**
- * Configure WebRTC Signaling & Admin Monitoring on Socket.io instance
+ * Configure WebRTC Signaling, 1-on-1 Random Matchmaking & Admin Monitoring
  * @param {import('socket.io').Server} io
  */
 export const setupSignaling = (io) => {
-  // Helper to broadcast active calls list to all connected admin monitors
+  // Helper to broadcast active calls & match queue stats to admin monitors and users
   const broadcastActiveCalls = () => {
     const activeCalls = roomStore.getAllActiveRooms();
-    io.of('/admin-monitor').emit('active-calls-updated', activeCalls);
-    io.to('admin-monitor-room').emit('active-calls-updated', activeCalls);
+    const queueStats = matchmaker.getWaitingStats();
+
+    io.of('/admin-monitor').emit('active-calls-updated', { activeCalls, queueStats });
+    io.to('admin-monitor-room').emit('active-calls-updated', { activeCalls, queueStats });
+    io.emit('queue-stats-updated', queueStats);
   };
 
   // Dedicated namespace for Admin Monitor
   const adminNamespace = io.of('/admin-monitor');
   adminNamespace.on('connection', (socket) => {
-    // Send immediate snapshot of all active rooms
-    socket.emit('active-calls-updated', roomStore.getAllActiveRooms());
-
-    socket.on('disconnect', () => {
-      // Admin disconnected, nothing to clean up
+    socket.emit('active-calls-updated', {
+      activeCalls: roomStore.getAllActiveRooms(),
+      queueStats: matchmaker.getWaitingStats(),
     });
   });
 
-  // Main namespace for WebRTC Peer Signaling
+  // Main namespace for WebRTC Peer Signaling & Matchmaking
   io.on('connection', (socket) => {
-    // Admin client joining monitor room via main namespace (fallback)
+    // Send immediate queue stats to connected user
+    socket.emit('queue-stats-updated', matchmaker.getWaitingStats());
+
     socket.on('join-admin-monitor', () => {
       socket.join('admin-monitor-room');
-      socket.emit('active-calls-updated', roomStore.getAllActiveRooms());
+      socket.emit('active-calls-updated', {
+        activeCalls: roomStore.getAllActiveRooms(),
+        queueStats: matchmaker.getWaitingStats(),
+      });
     });
 
     /**
-     * Join room
-     * payload: { roomId, user: { _id, name, avatar } }
+     * 1-on-1 RANDOM MATCHMAKING ENGINE
+     * payload: { myGender, targetGender, callType, user }
+     */
+    socket.on('find-match', async ({ myGender, targetGender, callType, user }) => {
+      socket.data.user = user || { name: 'Anonymous', _id: null };
+      socket.data.myGender = myGender || 'unspecified';
+      socket.data.targetGender = targetGender || 'any';
+      socket.data.callType = callType || 'video';
+
+      const matchResult = matchmaker.enqueue(socket.id, {
+        myGender: socket.data.myGender,
+        targetGender: socket.data.targetGender,
+        callType: socket.data.callType,
+        user: socket.data.user,
+      });
+
+      if (matchResult.matched) {
+        await connectMatchedPair(matchResult.userA, matchResult.userB, matchResult.roomId);
+      } else {
+        socket.emit('match-searching', {
+          queueSize: matchResult.queueSize,
+          message: 'Searching for a compatible partner...',
+        });
+        broadcastActiveCalls();
+      }
+    });
+
+    /**
+     * Cancel match search
+     */
+    socket.on('cancel-match', () => {
+      matchmaker.dequeue(socket.id);
+      socket.emit('match-canceled');
+      broadcastActiveCalls();
+    });
+
+    /**
+     * Skip to Next Partner
+     */
+    socket.on('skip-match', async ({ myGender, targetGender, callType, user } = {}) => {
+      const activePair = matchmaker.handleSkip(socket.id);
+      const prevRoomId = socket.data.roomId;
+
+      if (activePair) {
+        const { partnerSocketId, roomId } = activePair;
+
+        // Notify partner that they were skipped
+        io.to(partnerSocketId).emit('partner-skipped', {
+          message: 'Your partner moved to the next call.',
+        });
+
+        // Clean up room records
+        await handleRoomExit(roomId, socket.id, 'skipped');
+        await handleRoomExit(roomId, partnerSocketId, 'skipped');
+      } else if (prevRoomId) {
+        await handleRoomExit(prevRoomId, socket.id, 'skipped');
+      }
+
+      // Re-enqueue the skipping user
+      const candidateUser = user || socket.data.user;
+      const candidateMyGender = myGender || socket.data.myGender || 'unspecified';
+      const candidateTargetGender = targetGender || socket.data.targetGender || 'any';
+      const candidateCallType = callType || socket.data.callType || 'video';
+
+      const matchResult = matchmaker.enqueue(socket.id, {
+        myGender: candidateMyGender,
+        targetGender: candidateTargetGender,
+        callType: candidateCallType,
+        user: candidateUser,
+      });
+
+      if (matchResult.matched) {
+        await connectMatchedPair(matchResult.userA, matchResult.userB, matchResult.roomId);
+      } else {
+        socket.emit('match-searching', {
+          queueSize: matchResult.queueSize,
+          message: 'Searching for next partner...',
+        });
+        broadcastActiveCalls();
+      }
+    });
+
+    /**
+     * Helper to pair and connect two matched users
+     */
+    const connectMatchedPair = async (userA, userB, roomId) => {
+      const pA = {
+        userId: userA.user?._id || userA.user?.id || null,
+        name: userA.user?.name || 'Anonymous',
+        avatar: userA.user?.avatar || '',
+        gender: userA.myGender,
+        socketId: userA.socketId,
+      };
+
+      const pB = {
+        userId: userB.user?._id || userB.user?.id || null,
+        name: userB.user?.name || 'Anonymous',
+        avatar: userB.user?.avatar || '',
+        gender: userB.myGender,
+        socketId: userB.socketId,
+      };
+
+      const socketA = io.sockets.sockets.get(userA.socketId);
+      const socketB = io.sockets.sockets.get(userB.socketId);
+
+      if (socketA) {
+        socketA.join(roomId);
+        socketA.data.roomId = roomId;
+      }
+      if (socketB) {
+        socketB.join(roomId);
+        socketB.data.roomId = roomId;
+      }
+
+      const room = roomStore.createOrJoinRoom(roomId, pA);
+      roomStore.createOrJoinRoom(roomId, pB);
+
+      // Create database call record
+      try {
+        const callDoc = await Call.create({
+          roomId,
+          participants: [pA.userId, pB.userId].filter(Boolean),
+          caller: pA.userId || null,
+          callee: pB.userId || null,
+          startTime: new Date(room.startTime),
+          status: 'active',
+        });
+        room.callDocId = callDoc._id.toString();
+      } catch (err) {
+        console.error('[Match Call DB Error]', err.message);
+      }
+
+      // Notify User A (initiator, creates offer)
+      if (socketA) {
+        socketA.emit('match-connected', {
+          roomId,
+          partner: pB,
+          isInitiator: true,
+          callType: userA.callType,
+        });
+      }
+
+      // Notify User B (receiver, awaits offer and responds with answer)
+      if (socketB) {
+        socketB.emit('match-connected', {
+          roomId,
+          partner: pA,
+          isInitiator: false,
+          callType: userB.callType,
+        });
+      }
+
+      broadcastActiveCalls();
+    };
+
+    /**
+     * Standard Room Code Join (for direct /room/:roomId calls)
      */
     socket.on('join-room', async ({ roomId, user }) => {
       if (!roomId) return;
@@ -63,13 +225,11 @@ export const setupSignaling = (io) => {
 
       const room = roomStore.createOrJoinRoom(normalizedRoomId, participant);
 
-      // If this is the second participant, a call has officially connected!
       if (room.participants.length === 2) {
         const caller = room.participants[0];
         const callee = room.participants[1];
 
         try {
-          // Create or update database record for this call
           const callDoc = await Call.create({
             roomId: normalizedRoomId,
             participants: [caller.userId, callee.userId].filter(Boolean),
@@ -78,27 +238,23 @@ export const setupSignaling = (io) => {
             startTime: new Date(room.startTime),
             status: 'active',
           });
-
           room.callDocId = callDoc._id.toString();
         } catch (dbError) {
           console.error('[Call DB Creation Error]', dbError.message);
         }
       }
 
-      // Notify other peers in the room
       socket.to(normalizedRoomId).emit('user-joined', {
         participant,
         existingParticipants: room.participants,
       });
 
-      // Send current room state back to joining peer
       socket.emit('room-joined', {
         roomId: normalizedRoomId,
         participants: room.participants,
         isInitiator: room.participants.length === 1,
       });
 
-      // Broadcast update to Admin monitors
       broadcastActiveCalls();
     });
 
@@ -134,6 +290,18 @@ export const setupSignaling = (io) => {
     });
 
     /**
+     * In-Call Real-Time Text Chat Relay (Omegle style)
+     */
+    socket.on('chat-message', ({ roomId, message, sender, timestamp }) => {
+      if (!roomId || !message) return;
+      socket.to(roomId).emit('chat-message', {
+        message,
+        sender: sender || socket.data.user?.name || 'Stranger',
+        timestamp: timestamp || Date.now(),
+      });
+    });
+
+    /**
      * Media state toggle (mute/unmute audio or video)
      */
     socket.on('media-state', ({ roomId, isMuted, isVideoOff }) => {
@@ -149,21 +317,37 @@ export const setupSignaling = (io) => {
      */
     socket.on('leave-room', async ({ roomId }) => {
       const normalizedRoomId = roomId || socket.data.roomId;
-      if (!normalizedRoomId) return;
+      matchmaker.dequeue(socket.id);
+      matchmaker.handleSkip(socket.id);
 
-      await handleRoomExit(normalizedRoomId, socket.id, 'completed');
+      if (normalizedRoomId) {
+        await handleRoomExit(normalizedRoomId, socket.id, 'completed');
+      }
     });
 
     /**
-     * Disconnect handler (handles sudden dropped calls - Perspective #8)
+     * Disconnect handler
      */
     socket.on('disconnect', async () => {
       const socketId = socket.id;
-      const roomMatch = roomStore.findRoomBySocketId(socketId);
 
+      // Clean from matchmaker
+      matchmaker.dequeue(socketId);
+      const activePair = matchmaker.handleSkip(socketId);
+      if (activePair) {
+        io.to(activePair.partnerSocketId).emit('partner-disconnected', {
+          message: 'Your partner disconnected.',
+          canReconnect: false,
+        });
+        await handleRoomExit(activePair.roomId, socketId, 'dropped');
+      }
+
+      const roomMatch = roomStore.findRoomBySocketId(socketId);
       if (roomMatch) {
         await handleRoomExit(roomMatch.roomId, socketId, 'dropped');
       }
+
+      broadcastActiveCalls();
     });
 
     /**
@@ -174,24 +358,23 @@ export const setupSignaling = (io) => {
       if (!room) return;
 
       const leavingParticipant = room.participants.find((p) => p.socketId === socketId);
-      const remainingParticipants = room.participants.filter((p) => p.socketId !== socketId);
 
-      // Notify remaining peer in room
       if (exitStatus === 'dropped') {
         socket.to(roomId).emit('peer-disconnected', {
           socketId,
-          name: leavingParticipant?.name || 'Peer',
+          name: leavingParticipant?.name || 'Partner',
           reason: 'Network disconnect or window closed unexpectedly',
           canReconnect: true,
         });
+      } else if (exitStatus === 'skipped') {
+        // Handled by partner-skipped event
       } else {
         socket.to(roomId).emit('peer-left', {
           socketId,
-          name: leavingParticipant?.name || 'Peer',
+          name: leavingParticipant?.name || 'Partner',
         });
       }
 
-      // If call document was created, update it in MongoDB
       if (room.callDocId) {
         try {
           const durationSeconds = Math.max(
@@ -209,36 +392,30 @@ export const setupSignaling = (io) => {
         }
       }
 
-      // Remove participant from memory
       roomStore.removeParticipant(roomId, socketId);
       socket.leave(roomId);
 
-      // Broadcast active calls to admin monitors
       broadcastActiveCalls();
     };
   });
 
-  // Export termination function for Admin controller
   return {
     broadcastActiveCalls,
     terminateRoom: async (roomId, reason = 'Terminated by Administrator') => {
       const room = roomStore.getRoom(roomId);
       if (!room) return false;
 
-      // Notify all sockets in room
       io.to(roomId).emit('call-terminated', {
         reason,
         timestamp: Date.now(),
       });
 
-      // Update DB record
       if (room.callDocId) {
         try {
           const durationSeconds = Math.max(
             0,
             Math.floor((Date.now() - room.startTime) / 1000)
           );
-
           await Call.findByIdAndUpdate(room.callDocId, {
             endTime: new Date(),
             durationSeconds,
@@ -249,7 +426,6 @@ export const setupSignaling = (io) => {
         }
       }
 
-      // Disconnect all sockets from room
       io.in(roomId).socketsLeave(roomId);
       roomStore.deleteRoom(roomId);
       broadcastActiveCalls();
@@ -257,4 +433,3 @@ export const setupSignaling = (io) => {
     },
   };
 };
-

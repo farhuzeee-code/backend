@@ -3,6 +3,7 @@ import { Call } from '../models/Call.js';
 import { Settings } from '../models/Settings.js';
 import { Invoice } from '../models/Invoice.js';
 import { roomStore } from '../sockets/roomStore.js';
+import { matchmaker } from '../sockets/matchmaker.js';
 
 // Reference to terminateRoom injected from server setup
 let terminateRoomFn = null;
@@ -78,6 +79,7 @@ export const getStats = async (req, res, next) => {
         totalCalls,
         activeCallsCount,
         totalMinutes,
+        queueStats: matchmaker.getWaitingStats(),
       },
       signupsTrend,
     });
@@ -437,6 +439,10 @@ export const updatePlatformSettings = async (req, res, next) => {
 
     if (allowSignups !== undefined) {
       settings.allowSignups = Boolean(allowSignups);
+    }
+
+    if (req.body.genderFilterRequiresPro !== undefined) {
+      settings.genderFilterRequiresPro = Boolean(req.body.genderFilterRequiresPro);
     }
 
     if (maxCallDurationMinutes !== undefined) {
