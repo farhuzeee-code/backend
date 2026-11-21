@@ -10,7 +10,13 @@ export const setupSignaling = (io) => {
   // Helper to broadcast active calls & match queue stats to admin monitors and users
   const broadcastActiveCalls = () => {
     const activeCalls = roomStore.getAllActiveRooms();
-    const queueStats = matchmaker.getWaitingStats();
+    const waiting = matchmaker.getWaitingStats();
+    const totalOnline = io.engine ? io.engine.clientsCount : io.sockets.sockets.size;
+
+    const queueStats = {
+      ...waiting,
+      totalOnline,
+    };
 
     io.of('/admin-monitor').emit('active-calls-updated', { activeCalls, queueStats });
     io.to('admin-monitor-room').emit('active-calls-updated', { activeCalls, queueStats });
@@ -22,14 +28,17 @@ export const setupSignaling = (io) => {
   adminNamespace.on('connection', (socket) => {
     socket.emit('active-calls-updated', {
       activeCalls: roomStore.getAllActiveRooms(),
-      queueStats: matchmaker.getWaitingStats(),
+      queueStats: {
+        ...matchmaker.getWaitingStats(),
+        totalOnline: io.engine ? io.engine.clientsCount : io.sockets.sockets.size,
+      },
     });
   });
 
   // Main namespace for WebRTC Peer Signaling & Matchmaking
   io.on('connection', (socket) => {
-    // Send immediate queue stats to connected user
-    socket.emit('queue-stats-updated', matchmaker.getWaitingStats());
+    // Send immediate real queue stats to connected user
+    broadcastActiveCalls();
 
     socket.on('join-admin-monitor', () => {
       socket.join('admin-monitor-room');
@@ -262,7 +271,10 @@ export const setupSignaling = (io) => {
      * WebRTC SDP Offer Relay
      */
     socket.on('offer', ({ roomId, sdp }) => {
-      socket.to(roomId).emit('offer', {
+      const targetRoom = roomId || socket.data.roomId;
+      if (!targetRoom) return;
+      socket.to(targetRoom).emit('offer', {
+        roomId: targetRoom,
         sdp,
         senderSocketId: socket.id,
         senderUser: socket.data.user,
@@ -273,7 +285,10 @@ export const setupSignaling = (io) => {
      * WebRTC SDP Answer Relay
      */
     socket.on('answer', ({ roomId, sdp }) => {
-      socket.to(roomId).emit('answer', {
+      const targetRoom = roomId || socket.data.roomId;
+      if (!targetRoom) return;
+      socket.to(targetRoom).emit('answer', {
+        roomId: targetRoom,
         sdp,
         senderSocketId: socket.id,
       });
@@ -283,7 +298,10 @@ export const setupSignaling = (io) => {
      * WebRTC ICE Candidate Relay
      */
     socket.on('ice-candidate', ({ roomId, candidate }) => {
-      socket.to(roomId).emit('ice-candidate', {
+      const targetRoom = roomId || socket.data.roomId;
+      if (!targetRoom || !candidate) return;
+      socket.to(targetRoom).emit('ice-candidate', {
+        roomId: targetRoom,
         candidate,
         senderSocketId: socket.id,
       });
