@@ -10,6 +10,24 @@
  * - Never paired into the random stranger queue
  */
 
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+let greetingsCache = {};
+try {
+  const cachePath = path.join(__dirname, 'lyoraGreetingsCache.json');
+  if (fs.existsSync(cachePath)) {
+    greetingsCache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+    console.log(`Loaded ${Object.keys(greetingsCache).length} pre-cached Lyora greetings.`);
+  }
+} catch (e) {
+  console.warn('Failed to load lyoraGreetingsCache.json:', e);
+}
+
 export const lyoraState = {
   isBusy: false,
   activeCallerSocketId: null,
@@ -45,15 +63,15 @@ Personality & Demeanor:
   - Hindi: "Wait, tum kisi aur ladki se video call kar rahe the mujhse pehle? Mujhe chhod kar doosron se baat karte ho? Very bad, main jealous ho rahi hoon!"
 
 Spoken Cadence:
-- Keep replies between 1 to 3 spoken sentences so it feels like a fast, natural phone conversation without monologues.
+- Keep replies to 1 or 2 spoken sentences so speech generation is instant and natural like a phone call.
 - Never use robotic bullet points, headers, or AI disclaimers. You are a real girl enjoying a private phone call.
 `;
 
 const INITIAL_GREETINGS = [
-  "Hey there... I was hoping you'd call. I'm Lyora. How has your day been treating you?",
-  "Hello handsome! Entha vishesham? You caught me just in time, what's on your mind?",
-  "Arey hello! Finally you called me. Were you thinking about me, or did you just get lonely? *giggles*",
-  "Hey! It's Lyora. I was literally just waiting for your voice. How are you doing today?",
+  "Hey there... I was hoping you would call. I am Lyora. How has your day been treating you?",
+  "Hello handsome! Entha vishesham? You caught me just in time, what is on your mind?",
+  "Arey hello! Finally you called me. Were you thinking about me, or did you just get lonely?",
+  "Hey! It is Lyora. I was literally just waiting for your voice. How are you doing today?",
 ];
 
 /**
@@ -61,7 +79,7 @@ const INITIAL_GREETINGS = [
  */
 async function generateLyoraReply(userMessage, conversationHistory = []) {
   try {
-    const contents = conversationHistory.slice(-8).map((turn) => ({
+    const contents = conversationHistory.slice(-6).map((turn) => ({
       role: turn.role === 'user' ? 'user' : 'model',
       parts: [{ text: turn.text }],
     }));
@@ -83,7 +101,7 @@ async function generateLyoraReply(userMessage, conversationHistory = []) {
           contents,
           generationConfig: {
             temperature: 0.9,
-            maxOutputTokens: 120,
+            maxOutputTokens: 90,
             topP: 0.95,
           },
         }),
@@ -104,7 +122,7 @@ async function generateLyoraReply(userMessage, conversationHistory = []) {
   // Fallback if needed
   const lower = (userMessage || '').toLowerCase();
   if (lower.includes('other girl') || lower.includes('girls') || lower.includes('skip') || lower.includes('cam')) {
-    return "Wait... were you talking to other girls on AQELEO before calling me? Hmm, tell me honestly, you're not trying to make me jealous, are you?";
+    return "Wait... were you talking to other girls on AQELEO before calling me? Don't make me jealous!";
   }
   if (lower.includes('vishesham') || lower.includes('sugam') || lower.includes('entha')) {
     return "Enikku ningalodu samsaarikkan pattiya santoshamaanu! Enthaada, enne missing aayirunno?";
@@ -116,51 +134,60 @@ async function generateLyoraReply(userMessage, conversationHistory = []) {
 }
 
 /**
- * Generate Real Native AI Voice using Gemini 3.8 Flash TTS
- * Produces studio-grade 24kHz/WAV audio with natural human inflection
+ * Generate Real Native AI Voice using Gemini 3.8 Flash Lite TTS
+ * Fast 24kHz WAV audio generation with Aoede voice
  */
 async function generateLyoraVoice(text) {
   try {
-    // Strip emotion asterisks (e.g. *giggles*) for clear spoken audio
-    const spokenText = (text || '').replace(/\*[^*]+\*/g, '').trim();
+    // Strip emotion asterisks (e.g. *giggles*) and emojis for clear spoken audio
+    const spokenText = (text || '')
+      .replace(/\*[^*]+\*/g, '')
+      .replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, '')
+      .trim();
     if (!spokenText) return null;
 
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-tts:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: spokenText }] }],
-          generationConfig: {
-            responseModalities: ['AUDIO'],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: 'Aoede', // Charming, human-like female voice
+    // Try fast gemini-3.8-flash-lite-tts first, fallback to gemini-3.8-flash-tts
+    const ttsModels = ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'];
+
+    for (const model of ttsModels) {
+      try {
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: spokenText }] }],
+              generationConfig: {
+                responseModalities: ['AUDIO'],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: {
+                      voiceName: 'Aoede', // Charming, human-like female voice
+                    },
+                  },
                 },
               },
-            },
-          },
-        }),
-      }
-    );
+            }),
+          }
+        );
 
-    if (response.ok) {
-      const data = await response.json();
-      const part = data.candidates?.[0]?.content?.parts?.[0];
-      if (part?.inlineData?.data) {
-        return {
-          mimeType: part.inlineData.mimeType || 'audio/wav',
-          data: part.inlineData.data,
-        };
+        if (response.ok) {
+          const data = await response.json();
+          const part = data.candidates?.[0]?.content?.parts?.[0];
+          if (part?.inlineData?.data) {
+            return {
+              mimeType: part.inlineData.mimeType || 'audio/wav',
+              data: part.inlineData.data,
+            };
+          }
+        }
+      } catch (innerErr) {
+        console.warn(`TTS ${model} attempt failed:`, innerErr.message);
       }
-    } else {
-      const err = await response.text();
-      console.warn('Gemini 3.8 Flash TTS returned non-200:', err);
     }
   } catch (err) {
-    console.warn('Gemini 3.8 Flash TTS error:', err.message);
+    console.warn('Gemini Flash TTS error:', err.message);
   }
   return null;
 }
@@ -213,8 +240,11 @@ export function setupLyoraHandler(io) {
         text: greeting,
       });
 
-      // Generate Live AI WAV Audio from Gemini 3.8
-      const audioResult = await generateLyoraVoice(greeting);
+      // Use pre-cached studio WAV audio for instantaneous 0ms greeting response
+      let audioResult = greetingsCache[greeting] || null;
+      if (!audioResult) {
+        audioResult = await generateLyoraVoice(greeting);
+      }
 
       socket.emit('lyora-call-accepted', {
         success: true,
@@ -238,6 +268,9 @@ export function setupLyoraHandler(io) {
       if (!text || !text.trim()) return;
       const userText = text.trim();
 
+      // Notify caller that Lyora heard them and is processing
+      socket.emit('lyora-status', { state: 'thinking' });
+
       lyoraState.conversationHistory.push({
         role: 'user',
         text: userText,
@@ -251,7 +284,11 @@ export function setupLyoraHandler(io) {
         text: replyText,
       });
 
-      // 2. Generate Real Live AI WAV Audio with Gemini 3.8 Flash TTS
+      // Send text immediately so caller sees her reply without waiting for TTS
+      socket.emit('lyora-reply-text', { text: replyText });
+      socket.emit('lyora-status', { state: 'generating-voice' });
+
+      // 2. Generate Real Live AI WAV Audio with Gemini 3.8 Flash Lite TTS
       const audioResult = await generateLyoraVoice(replyText);
 
       socket.emit('lyora-reply', {
@@ -260,6 +297,7 @@ export function setupLyoraHandler(io) {
         mimeType: audioResult?.mimeType || 'audio/wav',
         timestamp: Date.now(),
       });
+      socket.emit('lyora-status', { state: 'speaking' });
     });
 
     /**
