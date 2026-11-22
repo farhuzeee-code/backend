@@ -346,10 +346,13 @@ Return JSON with format: {"transcription": "...", "reply": "..."}`,
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
+              system_instruction: {
+                parts: [{ text: LYORA_SYSTEM_INSTRUCTION }],
+              },
               contents,
               generationConfig: {
                 temperature: 0.9,
-                maxOutputTokens: 120,
+                maxOutputTokens: 140,
                 responseMimeType: 'application/json',
               },
             }),
@@ -362,9 +365,15 @@ Return JSON with format: {"transcription": "...", "reply": "..."}`,
           if (rawText) {
             let parsed = {};
             try {
-              parsed = JSON.parse(rawText);
+              const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+              if (jsonMatch) {
+                parsed = JSON.parse(jsonMatch[0]);
+              } else {
+                parsed = JSON.parse(rawText);
+              }
             } catch (e) {
-              parsed = { transcription: 'Voice message', reply: rawText };
+              const cleaned = rawText.replace(/```[a-z]*|```/gi, '').trim();
+              parsed = { transcription: 'Voice message', reply: cleaned };
             }
 
             const userText = parsed.transcription || 'Voice message';
