@@ -449,6 +449,15 @@ export const updatePlatformSettings = async (req, res, next) => {
       settings.enableAiCompanion = Boolean(req.body.enableAiCompanion);
     }
 
+    if (req.body.subscriptionsEnabled !== undefined) {
+      if (!settings.subscriptionPlan) settings.subscriptionPlan = {};
+      settings.subscriptionPlan.enabled = Boolean(req.body.subscriptionsEnabled);
+      if (!req.body.subscriptionsEnabled) {
+        settings.genderFilterRequiresPro = false;
+        settings.subscriptionPlan.requireSubscription = false;
+      }
+    }
+
     if (maxCallDurationMinutes !== undefined) {
       const minutes = Number(maxCallDurationMinutes);
       if (minutes < 5 || minutes > 720) {
