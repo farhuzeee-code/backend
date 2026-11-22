@@ -319,6 +319,7 @@ export function setupLyoraHandler(io) {
 
       if (!audioBase64) return;
 
+      console.log(`🎙️ Backend received audio from caller ${socket.id}, mime: ${cleanMime}, base64 len: ${audioBase64.length}`);
       socket.emit('lyora-status', { state: 'thinking' });
 
       const cleanMime = (mimeType || 'audio/webm').split(';')[0];
@@ -401,6 +402,7 @@ Return JSON with format: {"transcription": "...", "reply": "..."}`,
 
           const userText = parsed.transcription || 'Voice message';
           const replyText = parsed.reply || "I heard your sweet voice... tell me more!";
+          console.log(`✨ Lyora transcribed: "${userText}" | Reply: "${replyText}"`);
 
           lyoraState.conversationHistory.push({ role: 'user', text: userText });
           lyoraState.conversationHistory.push({ role: 'model', text: replyText });
