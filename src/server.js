@@ -15,6 +15,8 @@ import authRoutes from './routes/authRoutes.js';
 import callRoutes from './routes/callRoutes.js';
 import adminRoutes from './routes/adminRoutes.js';
 import subscriptionRoutes from './routes/subscriptionRoutes.js';
+import lyoraRoutes from './routes/lyoraRoutes.js';
+import { setupLyoraHandler } from './sockets/lyoraHandler.js';
 
 dotenv.config();
 
@@ -76,6 +78,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/calls', callRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/subscriptions', subscriptionRoutes);
+app.use('/api/lyora', lyoraRoutes);
 
 // Global Error Handler
 app.use(errorHandler);
@@ -106,6 +109,9 @@ const io = new SocketIOServer(server, {
 // Initialize WebRTC signaling & link termination method
 const signalingService = setupSignaling(io);
 setTerminateRoomFn(signalingService.terminateRoom);
+
+// Initialize Lyora AI Audio Companion Socket Handler
+setupLyoraHandler(io);
 
 // Start server
 const PORT = process.env.PORT || 5000;
