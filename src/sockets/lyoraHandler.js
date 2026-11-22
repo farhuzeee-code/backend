@@ -75,48 +75,51 @@ const INITIAL_GREETINGS = [
 ];
 
 /**
- * Generate Lyora's spoken text response using Gemini 2.5 Flash
+ * Generate Lyora's spoken text response using Gemini 3.5 Flash / Flash Lite
  */
 async function generateLyoraReply(userMessage, conversationHistory = []) {
-  try {
-    const contents = conversationHistory.slice(-6).map((turn) => ({
-      role: turn.role === 'user' ? 'user' : 'model',
-      parts: [{ text: turn.text }],
-    }));
+  const models = ['gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-2.5-flash'];
+  for (const model of models) {
+    try {
+      const contents = conversationHistory.slice(-6).map((turn) => ({
+        role: turn.role === 'user' ? 'user' : 'model',
+        parts: [{ text: turn.text }],
+      }));
 
-    contents.push({
-      role: 'user',
-      parts: [{ text: userMessage }],
-    });
+      contents.push({
+        role: 'user',
+        parts: [{ text: userMessage }],
+      });
 
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          system_instruction: {
-            parts: [{ text: LYORA_SYSTEM_INSTRUCTION }],
-          },
-          contents,
-          generationConfig: {
-            temperature: 0.9,
-            maxOutputTokens: 90,
-            topP: 0.95,
-          },
-        }),
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            system_instruction: {
+              parts: [{ text: LYORA_SYSTEM_INSTRUCTION }],
+            },
+            contents,
+            generationConfig: {
+              temperature: 0.9,
+              maxOutputTokens: 250,
+              topP: 0.95,
+            },
+          }),
+        }
+      );
+
+      if (response.ok) {
+        const data = await response.json();
+        const candidate = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (candidate) {
+          return candidate.trim();
+        }
       }
-    );
-
-    if (response.ok) {
-      const data = await response.json();
-      const candidate = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (candidate) {
-        return candidate.trim();
-      }
+    } catch (err) {
+      console.warn(`Gemini text inference error (${model}):`, err.message);
     }
-  } catch (err) {
-    console.warn('Gemini 2.5 text inference error:', err.message);
   }
 
   // Fallback if needed
@@ -146,8 +149,13 @@ async function generateLyoraVoice(text) {
       .trim();
     if (!spokenText) return null;
 
-    // Try fast gemini-3.8-flash-lite-tts first, fallback to gemini-3.8-flash-tts
-    const ttsModels = ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'];
+    // Try fast gemini-3.8-flash-lite-tts first, fallback across multiple TTS models
+    const ttsModels = [
+      'gemini-3.8-flash-lite-tts',
+      'gemini-3.8-flash-tts',
+      'gemini-3.1-flash-tts-preview',
+      'gemini-2.5-flash-preview-tts',
+    ];
 
     for (const model of ttsModels) {
       try {
@@ -340,63 +348,77 @@ Return JSON with format: {"transcription": "...", "reply": "..."}`,
           ],
         });
 
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              system_instruction: {
-                parts: [{ text: LYORA_SYSTEM_INSTRUCTION }],
-              },
-              contents,
-              generationConfig: {
-                temperature: 0.9,
-                maxOutputTokens: 140,
-                responseMimeType: 'application/json',
-              },
-            }),
-          }
-        );
+        const audioModels = ['gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-2.5-flash'];
+        let rawText = null;
 
-        if (response.ok) {
-          const data = await response.json();
-          const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (rawText) {
-            let parsed = {};
-            try {
-              const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-              if (jsonMatch) {
-                parsed = JSON.parse(jsonMatch[0]);
-              } else {
-                parsed = JSON.parse(rawText);
+        for (const model of audioModels) {
+          try {
+            const response = await fetch(
+              `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  system_instruction: {
+                    parts: [{ text: LYORA_SYSTEM_INSTRUCTION }],
+                  },
+                  contents,
+                  generationConfig: {
+                    temperature: 0.85,
+                    maxOutputTokens: 1000,
+                    responseMimeType: 'application/json',
+                  },
+                }),
               }
-            } catch (e) {
-              const cleaned = rawText.replace(/```[a-z]*|```/gi, '').trim();
-              parsed = { transcription: 'Voice message', reply: cleaned };
+            );
+
+            if (response.ok) {
+              const data = await response.json();
+              rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+              if (rawText) break;
+            } else {
+              const errBody = await response.text();
+              console.warn(`Audio model ${model} returned ${response.status}:`, errBody.slice(0, 150));
             }
-
-            const userText = parsed.transcription || 'Voice message';
-            const replyText = parsed.reply || "I heard your sweet voice... tell me more!";
-
-            lyoraState.conversationHistory.push({ role: 'user', text: userText });
-            lyoraState.conversationHistory.push({ role: 'model', text: replyText });
-
-            socket.emit('lyora-user-transcription', { text: userText });
-            socket.emit('lyora-reply-text', { text: replyText });
-            socket.emit('lyora-status', { state: 'generating-voice' });
-
-            const audioResult = await generateLyoraVoice(replyText);
-
-            socket.emit('lyora-reply', {
-              text: replyText,
-              audioData: audioResult?.data || null,
-              mimeType: audioResult?.mimeType || 'audio/wav',
-              timestamp: Date.now(),
-            });
-            socket.emit('lyora-status', { state: 'speaking' });
-            return;
+          } catch (mErr) {
+            console.warn(`Audio model ${model} fetch failed:`, mErr.message);
           }
+        }
+
+        if (rawText) {
+          let parsed = {};
+          try {
+            const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+              parsed = JSON.parse(jsonMatch[0]);
+            } else {
+              parsed = JSON.parse(rawText);
+            }
+          } catch (e) {
+            const cleaned = rawText.replace(/```[a-z]*|```/gi, '').trim();
+            parsed = { transcription: 'Voice message', reply: cleaned };
+          }
+
+          const userText = parsed.transcription || 'Voice message';
+          const replyText = parsed.reply || "I heard your sweet voice... tell me more!";
+
+          lyoraState.conversationHistory.push({ role: 'user', text: userText });
+          lyoraState.conversationHistory.push({ role: 'model', text: replyText });
+
+          socket.emit('lyora-user-transcription', { text: userText });
+          socket.emit('lyora-reply-text', { text: replyText });
+          socket.emit('lyora-status', { state: 'generating-voice' });
+
+          const audioResult = await generateLyoraVoice(replyText);
+
+          socket.emit('lyora-reply', {
+            text: replyText,
+            audioData: audioResult?.data || null,
+            mimeType: audioResult?.mimeType || 'audio/wav',
+            timestamp: Date.now(),
+          });
+          socket.emit('lyora-status', { state: 'speaking' });
+          return;
         }
       } catch (err) {
         console.warn('Audio input processing error:', err.message);
