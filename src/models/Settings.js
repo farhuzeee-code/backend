@@ -59,6 +59,10 @@ const settingsSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    enableAiCompanion: {
+      type: Boolean,
+      default: true,
+    },
     subscriptionPlan: {
       type: subscriptionPlanSchema,
       default: () => ({}),

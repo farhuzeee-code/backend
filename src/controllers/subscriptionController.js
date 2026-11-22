@@ -27,9 +27,18 @@ export const getPublicPlan = async (req, res, next) => {
       requireSubscription: false,
     };
 
+    const planObj = plan.toObject ? plan.toObject() : plan;
+
     res.json({
       success: true,
-      plan,
+      plan: {
+        ...planObj,
+        enableAiCompanion: settings.enableAiCompanion ?? true,
+        genderFilterRequiresPro: settings.genderFilterRequiresPro ?? false,
+      },
+      enableAiCompanion: settings.enableAiCompanion ?? true,
+      genderFilterRequiresPro: settings.genderFilterRequiresPro ?? false,
+      subscriptionEnabled: Boolean(planObj.enabled),
     });
   } catch (error) {
     next(error);

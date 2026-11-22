@@ -445,6 +445,10 @@ export const updatePlatformSettings = async (req, res, next) => {
       settings.genderFilterRequiresPro = Boolean(req.body.genderFilterRequiresPro);
     }
 
+    if (req.body.enableAiCompanion !== undefined) {
+      settings.enableAiCompanion = Boolean(req.body.enableAiCompanion);
+    }
+
     if (maxCallDurationMinutes !== undefined) {
       const minutes = Number(maxCallDurationMinutes);
       if (minutes < 5 || minutes > 720) {
