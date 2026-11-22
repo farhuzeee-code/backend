@@ -273,6 +273,7 @@ export const setupSignaling = (io) => {
     socket.on('offer', ({ roomId, sdp }) => {
       const targetRoom = roomId || socket.data.roomId;
       if (!targetRoom) return;
+      console.log(`[Signaling] Relaying offer for room ${targetRoom} from socket ${socket.id}`);
       socket.to(targetRoom).emit('offer', {
         roomId: targetRoom,
         sdp,
@@ -287,6 +288,7 @@ export const setupSignaling = (io) => {
     socket.on('answer', ({ roomId, sdp }) => {
       const targetRoom = roomId || socket.data.roomId;
       if (!targetRoom) return;
+      console.log(`[Signaling] Relaying answer for room ${targetRoom} from socket ${socket.id}`);
       socket.to(targetRoom).emit('answer', {
         roomId: targetRoom,
         sdp,
