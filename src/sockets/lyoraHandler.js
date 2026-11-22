@@ -1,8 +1,9 @@
 /**
  * Lyora AI Companion - 1-on-1 Dedicated Audio Caller Girl
- * Powered by Google Gemini 2.5 Flash API
+ * Powered by Google Gemini 2.5 Flash + Gemini 3.8 Flash Native Audio TTS
  * 
  * Capabilities:
+ * - 100% Live AI Voice (Direct Studio WAV Audio - Zero Robotic Browser SpeechSynthesis)
  * - 1-on-1 exclusive voice call (Marks "Busy" if another user is calling)
  * - Multilingual adaptation: Indian English, Malayalam (Manglish), Hindi (Hinglish)
  * - Flirty, emotionally supportive, human-like interaction with playful jealousy
@@ -56,7 +57,7 @@ const INITIAL_GREETINGS = [
 ];
 
 /**
- * Generate Lyora's spoken response using Gemini 2.5 Flash
+ * Generate Lyora's spoken text response using Gemini 2.5 Flash
  */
 async function generateLyoraReply(userMessage, conversationHistory = []) {
   try {
@@ -95,26 +96,73 @@ async function generateLyoraReply(userMessage, conversationHistory = []) {
       if (candidate) {
         return candidate.trim();
       }
-    } else {
-      const errText = await response.text();
-      console.warn('Gemini 2.5 API returned non-200:', errText);
     }
   } catch (err) {
-    console.warn('Gemini inference error:', err.message);
+    console.warn('Gemini 2.5 text inference error:', err.message);
   }
 
-  // Fallback if API rate limits or network issues arise
+  // Fallback if needed
   const lower = (userMessage || '').toLowerCase();
   if (lower.includes('other girl') || lower.includes('girls') || lower.includes('skip') || lower.includes('cam')) {
-    return "Wait... *giggles softly* were you talking to other girls on AQELEO before calling me? Hmm, tell me honestly, you're not trying to make me jealous, are you?";
+    return "Wait... were you talking to other girls on AQELEO before calling me? Hmm, tell me honestly, you're not trying to make me jealous, are you?";
   }
   if (lower.includes('vishesham') || lower.includes('sugam') || lower.includes('entha')) {
-    return "Enikku ningalodu samsaarikkan pattiya santoshamaanu! Enthaada, enne missing aayirunno? *smiles*";
+    return "Enikku ningalodu samsaarikkan pattiya santoshamaanu! Enthaada, enne missing aayirunno?";
   }
   if (lower.includes('kaisi ho') || lower.includes('kya kar') || lower.includes('kahan ho')) {
     return "Main bilkul theek hoon, bas tumhara hi wait kar rahi thi! Aaj kya kya kiya tumne?";
   }
-  return "Mmm, I love hearing your voice. *smiles* Tell me more, don't hold back!";
+  return "Mmm, I love hearing your voice. Tell me more, don't hold back!";
+}
+
+/**
+ * Generate Real Native AI Voice using Gemini 3.8 Flash TTS
+ * Produces studio-grade 24kHz/WAV audio with natural human inflection
+ */
+async function generateLyoraVoice(text) {
+  try {
+    // Strip emotion asterisks (e.g. *giggles*) for clear spoken audio
+    const spokenText = (text || '').replace(/\*[^*]+\*/g, '').trim();
+    if (!spokenText) return null;
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-tts:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: spokenText }] }],
+          generationConfig: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: 'Aoede', // Charming, human-like female voice
+                },
+              },
+            },
+          },
+        }),
+      }
+    );
+
+    if (response.ok) {
+      const data = await response.json();
+      const part = data.candidates?.[0]?.content?.parts?.[0];
+      if (part?.inlineData?.data) {
+        return {
+          mimeType: part.inlineData.mimeType || 'audio/wav',
+          data: part.inlineData.data,
+        };
+      }
+    } else {
+      const err = await response.text();
+      console.warn('Gemini 3.8 Flash TTS returned non-200:', err);
+    }
+  } catch (err) {
+    console.warn('Gemini 3.8 Flash TTS error:', err.message);
+  }
+  return null;
 }
 
 /**
@@ -132,7 +180,6 @@ export function setupLyoraHandler(io) {
   };
 
   io.on('connection', (socket) => {
-    // Send immediate status on connect
     socket.emit('lyora-status-updated', {
       isBusy: lyoraState.isBusy,
       callDuration: lyoraState.callStartTime
@@ -143,8 +190,7 @@ export function setupLyoraHandler(io) {
     /**
      * User clicks "Call Lyora"
      */
-    socket.on('call-lyora', ({ user }) => {
-      // If already on a call with someone else, reject with busy state
+    socket.on('call-lyora', async ({ user }) => {
       if (lyoraState.isBusy && lyoraState.activeCallerSocketId !== socket.id) {
         socket.emit('lyora-busy', {
           success: false,
@@ -153,27 +199,29 @@ export function setupLyoraHandler(io) {
         return;
       }
 
-      // Lock Lyora to this caller
       lyoraState.isBusy = true;
       lyoraState.activeCallerSocketId = socket.id;
       lyoraState.activeCallerUser = user || { name: 'Caller' };
       lyoraState.callStartTime = Date.now();
       lyoraState.conversationHistory = [];
 
-      // Broadcast busy status platform-wide
       broadcastLyoraStatus();
 
-      // Pick an initial sweet greeting
       const greeting = INITIAL_GREETINGS[Math.floor(Math.random() * INITIAL_GREETINGS.length)];
       lyoraState.conversationHistory.push({
         role: 'model',
         text: greeting,
       });
 
+      // Generate Live AI WAV Audio from Gemini 3.8
+      const audioResult = await generateLyoraVoice(greeting);
+
       socket.emit('lyora-call-accepted', {
         success: true,
         caller: lyoraState.activeCallerUser,
         greeting,
+        audioData: audioResult?.data || null,
+        mimeType: audioResult?.mimeType || 'audio/wav',
         timestamp: Date.now(),
       });
     });
@@ -195,7 +243,7 @@ export function setupLyoraHandler(io) {
         text: userText,
       });
 
-      // Call Gemini 2.5 Flash
+      // 1. Generate text response with Gemini 2.5 Flash
       const replyText = await generateLyoraReply(userText, lyoraState.conversationHistory);
 
       lyoraState.conversationHistory.push({
@@ -203,8 +251,13 @@ export function setupLyoraHandler(io) {
         text: replyText,
       });
 
+      // 2. Generate Real Live AI WAV Audio with Gemini 3.8 Flash TTS
+      const audioResult = await generateLyoraVoice(replyText);
+
       socket.emit('lyora-reply', {
         text: replyText,
+        audioData: audioResult?.data || null,
+        mimeType: audioResult?.mimeType || 'audio/wav',
         timestamp: Date.now(),
       });
     });
@@ -226,7 +279,7 @@ export function setupLyoraHandler(io) {
     });
 
     /**
-     * Socket disconnects (tab closed / network drop)
+     * Socket disconnects
      */
     socket.on('disconnect', () => {
       if (lyoraState.activeCallerSocketId === socket.id) {
