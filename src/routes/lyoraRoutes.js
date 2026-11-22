@@ -21,5 +21,18 @@ router.get('/status', (req, res) => {
   });
 });
 
+/**
+ * @route   POST /api/lyora/reset
+ * @desc    Reset Lyora busy state
+ */
+router.all('/reset', (req, res) => {
+  lyoraState.isBusy = false;
+  lyoraState.activeCallerSocketId = null;
+  lyoraState.activeCallerUser = null;
+  lyoraState.callStartTime = null;
+  lyoraState.conversationHistory = [];
+  res.json({ success: true, message: 'Lyora state successfully reset.' });
+});
+
 export default router;
 
