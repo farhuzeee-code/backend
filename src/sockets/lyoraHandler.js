@@ -301,6 +301,108 @@ export function setupLyoraHandler(io) {
     });
 
     /**
+     * User sends direct recorded microphone audio (100% browser compatibility)
+     */
+    socket.on('lyora-user-audio', async ({ audioBase64, mimeType }) => {
+      if (!lyoraState.isBusy || lyoraState.activeCallerSocketId !== socket.id) {
+        socket.emit('lyora-error', { message: 'Not connected to Lyora.' });
+        return;
+      }
+
+      if (!audioBase64) return;
+
+      socket.emit('lyora-status', { state: 'thinking' });
+
+      const cleanMime = (mimeType || 'audio/webm').split(';')[0];
+
+      try {
+        const contents = lyoraState.conversationHistory.slice(-6).map((turn) => ({
+          role: turn.role === 'user' ? 'user' : 'model',
+          parts: [{ text: turn.text }],
+        }));
+
+        contents.push({
+          role: 'user',
+          parts: [
+            {
+              inlineData: {
+                mimeType: cleanMime,
+                data: audioBase64,
+              },
+            },
+            {
+              text: `${LYORA_SYSTEM_INSTRUCTION}
+The user just spoke to you in the audio attached.
+1. Transcribe what the user said (Malayalam/Manglish, Hindi/Hinglish, or Indian English).
+2. Reply directly to them as Lyora in 1-2 sweet spoken sentences, adapting to their language and demeanor.
+Return JSON with format: {"transcription": "...", "reply": "..."}`,
+            },
+          ],
+        });
+
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents,
+              generationConfig: {
+                temperature: 0.9,
+                maxOutputTokens: 120,
+                responseMimeType: 'application/json',
+              },
+            }),
+          }
+        );
+
+        if (response.ok) {
+          const data = await response.json();
+          const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (rawText) {
+            let parsed = {};
+            try {
+              parsed = JSON.parse(rawText);
+            } catch (e) {
+              parsed = { transcription: 'Voice message', reply: rawText };
+            }
+
+            const userText = parsed.transcription || 'Voice message';
+            const replyText = parsed.reply || "I heard your sweet voice... tell me more!";
+
+            lyoraState.conversationHistory.push({ role: 'user', text: userText });
+            lyoraState.conversationHistory.push({ role: 'model', text: replyText });
+
+            socket.emit('lyora-user-transcription', { text: userText });
+            socket.emit('lyora-reply-text', { text: replyText });
+            socket.emit('lyora-status', { state: 'generating-voice' });
+
+            const audioResult = await generateLyoraVoice(replyText);
+
+            socket.emit('lyora-reply', {
+              text: replyText,
+              audioData: audioResult?.data || null,
+              mimeType: audioResult?.mimeType || 'audio/wav',
+              timestamp: Date.now(),
+            });
+            socket.emit('lyora-status', { state: 'speaking' });
+            return;
+          }
+        }
+      } catch (err) {
+        console.warn('Audio input processing error:', err.message);
+      }
+
+      socket.emit('lyora-reply', {
+        text: "I heard your voice, sweetie! Say that again, I want to hear you clearly.",
+        audioData: null,
+        mimeType: 'audio/wav',
+        timestamp: Date.now(),
+      });
+      socket.emit('lyora-status', { state: 'speaking' });
+    });
+
+    /**
      * Caller hangs up
      */
     socket.on('end-lyora-call', () => {
