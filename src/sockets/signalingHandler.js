@@ -338,7 +338,19 @@ export const setupSignaling = (io) => {
     socket.on('leave-room', async ({ roomId }) => {
       const normalizedRoomId = roomId || socket.data.roomId;
       matchmaker.dequeue(socket.id);
-      matchmaker.handleSkip(socket.id);
+      const activePair = matchmaker.handleSkip(socket.id);
+
+      if (activePair) {
+        io.to(activePair.partnerSocketId).emit('partner-disconnected', {
+          message: 'Your partner ended the call.',
+          canReconnect: false,
+        });
+        io.to(activePair.partnerSocketId).emit('peer-left', {
+          socketId: socket.id,
+          name: socket.data.user?.name || 'Partner',
+          message: 'Your partner ended the call.',
+        });
+      }
 
       if (normalizedRoomId) {
         await handleRoomExit(normalizedRoomId, socket.id, 'completed');
