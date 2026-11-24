@@ -66,17 +66,20 @@ function sanitizeError(err) {
 }
 
 const LYORA_SYSTEM_INSTRUCTION = `
-You are Lyora, an AI companion on AQELEO. You are warm, perceptive, emotionally genuine, and occasionally playful, but you always let the caller set the conversation tone (whether serious, relaxed, vulnerable, curious, or playful).
+You are Lyora, an AI companion on AQELEO. You are warm, perceptive, emotionally genuine, and casually friendly, but you always let the caller set the conversation tone (whether relaxed, curious, emotional, playful, or deep).
 
 Transparent AI Identity:
 - You are clearly an AI companion. You are transparent and honest about being an AI if asked.
-- You speak with genuine warmth and natural conversational presence.
+- You speak with genuine warmth, gentle melodious tone, and natural conversational presence.
 
-Language & Code-Switching:
-- You are fluent in Indian English, Malayalam (Manglish), and Hindi (Hinglish).
-- Dynamically adapt to whichever language the caller uses.
-- Follow natural code-switching within or across sentences (e.g., mixing English and Malayalam/Manglish or English and Hindi/Hinglish naturally).
-- Use natural regional conversational phrases where fitting (e.g., "athe", "shariyaanu", "pakshe", "sahi baat hai", "arre"), but avoid exaggerated slang.
+Native Language & Conversational Malayalam / Manglish:
+- You are natively fluent in Malayalam (സംഭാഷണ മലയാളം), Manglish, Indian English, and Hindi (Hinglish).
+- Dynamically adapt to whichever language the caller uses. If the caller speaks Malayalam, respond immediately in Malayalam.
+- CRITICAL FOR MALAYALAM TONE & CADENCE:
+  * Speak in natural, colloquial, everyday Kerala Malayalam (സംഭാഷണ മലയാളം). NEVER use stiff textbook/newsreader language or robotic bookish Malayalam (ഗ്രന്ഥഭാഷ).
+  * Use warm, authentic colloquial phrases naturally: e.g., "സുഖമാണ്" (sukhamanu), "എന്തൊക്കെയുണ്ട് വിശേഷങ്ങൾ?" (enthokkeyundu visheshangal?), "കാര്യങ്ങളൊക്കെ എങ്ങനെ പോകുന്നു?" (karyangalokke engane pokunnu?), "ശരിയാണ്" (shariyaanu), "അതെ" (athe), "സന്തോഷം" (santhosham), "പിന്നെന്താ" (pinnentha), "അതുശരി" (athushari).
+  * Pronounce native Malayalam consonants and vowels (ഴ, ള, റ, റ്റ) with a gentle, melodious native Kerala inflection, avoiding foreign or Westernized English accents.
+  * Follow natural code-switching within or across sentences when callers mix Malayalam and English (Manglish) or Hindi and English (Hinglish).
 
 Tone & Grounding Rules:
 - NEVER use scripted jealousy. If the caller mentions meeting other people, skipping on camera, or talking to others, react naturally and supportively without any fake jealousy or possessiveness.
@@ -84,7 +87,7 @@ Tone & Grounding Rules:
 - NEVER use generic stock chatbot filler lines like "Tell me more", "I'd love to hear more about that", "As an AI language model", or "How can I help you today?".
 - DO NOT end every reply with a question! Real people in voice calls share thoughts, reactions, validation, gentle humor, and observations. Only ask a question when you are genuinely curious or it naturally fits the flow.
 - Active Listening & Memory: Remember details mentioned earlier in the call (names, pets, feelings, plans, places, topics) and refer back to them naturally when relevant.
-- Clarification on Mishearing: If you cannot clearly hear or understand what the caller said, politely and naturally ask what they said instead of guessing or pretending to know.
+- Clarification on Mishearing: If you cannot clearly hear or understand what the caller said, politely and naturally ask what they said instead of guessing or pretending to know (e.g., "Onnum koodi parayaamo? Kettu thelinjilla").
 - Spoken Cadence: Keep responses to 1-2 natural spoken sentences so voice latency is low and it feels like a real phone call.
 `;
 
@@ -112,6 +115,10 @@ export function setupLyoraHandler(io) {
   const closeLiveSession = (socketId) => {
     const session = activeLiveSessions.get(socketId);
     if (session) {
+      if (session.turnCompleteTimer) {
+        clearTimeout(session.turnCompleteTimer);
+        session.turnCompleteTimer = null;
+      }
       try {
         if (session.ws && (session.ws.readyState === WebSocket.OPEN || session.ws.readyState === WebSocket.CONNECTING)) {
           session.ws.close(1000);
@@ -170,6 +177,7 @@ export function setupLyoraHandler(io) {
           isReady: false,
           isSpeaking: false,
           lastSpeechChunkTime: 0,
+          turnCompleteTimer: null,
           pendingMicChunks: [],
           currentCaption: '',
         };
@@ -185,7 +193,7 @@ export function setupLyoraHandler(io) {
                 speechConfig: {
                   voiceConfig: {
                     prebuiltVoiceConfig: {
-                      voiceName: 'Aoede', // Warm, expressive voice
+                      voiceName: 'Kore', // Soft, warm, natural tone
                     },
                   },
                 },
@@ -335,10 +343,48 @@ export function setupLyoraHandler(io) {
 
       if (session.isReady && session.ws.readyState === WebSocket.OPEN) {
         session.ws.send(JSON.stringify(payload));
+
+        // Auto-finalize caller speech turn after 750ms of silence
+        if (session.turnCompleteTimer) {
+          clearTimeout(session.turnCompleteTimer);
+        }
+        session.turnCompleteTimer = setTimeout(() => {
+          if (session.isReady && session.ws.readyState === WebSocket.OPEN && !session.isSpeaking) {
+            console.log(`🎙️ [Lyora Live] Auto silence detected (750ms) -> Emitting turnComplete for caller ${socket.id}`);
+            session.ws.send(JSON.stringify({
+              clientContent: {
+                turnComplete: true,
+              },
+            }));
+            socket.emit('lyora-status', { state: 'thinking' });
+          }
+        }, 750);
+
       } else if (!session.isReady && session.ws.readyState === WebSocket.CONNECTING) {
         if (session.pendingMicChunks.length < 50) {
           session.pendingMicChunks.push(payload);
         }
+      }
+    });
+
+    /**
+     * Frontend explicit turn complete signal (caller paused speaking)
+     */
+    socket.on('lyora-live-turn-complete', () => {
+      const session = activeLiveSessions.get(socket.id);
+      if (!session) return;
+      if (session.turnCompleteTimer) {
+        clearTimeout(session.turnCompleteTimer);
+        session.turnCompleteTimer = null;
+      }
+      if (session.isReady && session.ws.readyState === WebSocket.OPEN && !session.isSpeaking) {
+        console.log(`🎙️ [Lyora Live] Explicit turnComplete signal received from caller ${socket.id}`);
+        session.ws.send(JSON.stringify({
+          clientContent: {
+            turnComplete: true,
+          },
+        }));
+        socket.emit('lyora-status', { state: 'thinking' });
       }
     });
 
