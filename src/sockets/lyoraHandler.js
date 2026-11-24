@@ -213,17 +213,6 @@ export function setupLyoraHandler(io) {
               session.isReady = true;
               console.log(`✨ [Lyora Live] Session setup complete for caller ${socket.id}`);
 
-              // Inject the greeting into session context so Gemini remembers what Lyora said
-              liveWs.send(JSON.stringify({
-                clientContent: {
-                  turns: [{
-                    role: 'model',
-                    parts: [{ text: greeting }],
-                  }],
-                  turnComplete: false,
-                },
-              }));
-
               // Flush any mic chunks queued while setup was connecting
               if (session.pendingMicChunks.length > 0) {
                 console.log(`🎙️ [Lyora Live] Flushing ${session.pendingMicChunks.length} queued mic chunks`);
