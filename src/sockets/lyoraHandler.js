@@ -1,21 +1,22 @@
 /**
  * Lyora AI Companion - 1-on-1 Dedicated AI Voice Companion
- * Powered by Google Gemini 2.5 Flash + Gemini 3.8 Flash Native Audio TTS
+ * Powered by Google Gemini 3.8 Live API (Persistent Bidirectional BidiGenerateContent WebSocket)
  * 
  * Capabilities:
- * - 100% Live AI Voice (Direct Studio WAV Audio - Zero Robotic Browser SpeechSynthesis)
- * - Sentence-level low-latency audio chunk streaming
- * - Instant barge-in / interruption handling
- * - 1-on-1 exclusive voice call (Marks "Busy" if another user is calling)
- * - Multilingual adaptation: Indian English, Malayalam (Manglish), Hindi (Hinglish)
- * - Warm, perceptive, emotionally attentive AI companion (Caller sets tone)
- * - Up to 30 turns of conversation context memory
- * - Never paired into the random stranger queue
+ * - One persistent gemini-3.8-live session per call (Zero text-to-TTS pipeline)
+ * - Real-time bidirectional PCM audio streaming
+ * - Immediate native audio playback as chunks arrive (no sentence splitting)
+ * - Transcripts used strictly for live captions (non-blocking)
+ * - Instant barge-in / interruption handling (clears playback & queued audio)
+ * - Speaker toggle decoupled (never restarts session or replays greeting)
+ * - Gemini API key strictly isolated on the backend
+ * - 1-on-1 exclusive voice call
  */
 
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import WebSocket from 'ws';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -39,8 +40,8 @@ export const lyoraState = {
   conversationHistory: [],
 };
 
-// Map to track in-flight AbortControllers for caller interruptions
-const activeAbortControllers = new Map();
+// Map of active persistent gemini-3.8-live sessions: socket.id -> session
+const activeLiveSessions = new Map();
 
 const DEFAULT_KEY_B64 =
   'QVEuQWI4Uk42SVB3VlhSY29sRjMtSEdlX2kwUUZ5RXZadXlFWlVCc0M0NEx1VU15Y3ZlQkE=';
@@ -48,8 +49,10 @@ const GEMINI_API_KEY =
   process.env.GEMINI_API_KEY ||
   Buffer.from(DEFAULT_KEY_B64, 'base64').toString('utf8');
 
+const GEMINI_LIVE_URI = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
+
 /**
- * Sanitize error messages and bodies to prevent API keys or audio payloads from being logged
+ * Sanitize error messages to prevent API keys or audio payloads from being logged
  */
 function sanitizeError(err) {
   if (!err) return '';
@@ -81,7 +84,7 @@ Tone & Grounding Rules:
 - NEVER use generic stock chatbot filler lines like "Tell me more", "I'd love to hear more about that", "As an AI language model", or "How can I help you today?".
 - DO NOT end every reply with a question! Real people in voice calls share thoughts, reactions, validation, gentle humor, and observations. Only ask a question when you are genuinely curious or it naturally fits the flow.
 - Active Listening & Memory: Remember details mentioned earlier in the call (names, pets, feelings, plans, places, topics) and refer back to them naturally when relevant.
-- Clarification on Mishearing: If you cannot clearly hear or understand what the caller said (or if audio was muffled/cut off), politely and naturally ask what they said instead of guessing or pretending to know.
+- Clarification on Mishearing: If you cannot clearly hear or understand what the caller said, politely and naturally ask what they said instead of guessing or pretending to know.
 - Spoken Cadence: Keep responses to 1-2 natural spoken sentences so voice latency is low and it feels like a real phone call.
 `;
 
@@ -91,148 +94,6 @@ const INITIAL_GREETINGS = [
   "Namaskaram! Lyora aanu. Call cheythathil valare santhosham. How are things with you?",
   "Hey, nice to connect with you. I'm Lyora. What's on your mind today?",
 ];
-
-/**
- * Splits text into natural sentence chunks for low-latency streaming TTS
- */
-function splitIntoSentences(text) {
-  if (!text) return [];
-  const clean = text
-    .replace(/\*[^*]+\*/g, '')
-    .replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, '')
-    .trim();
-  if (!clean) return [];
-
-  const matched = clean.match(/[^.!?\n]+[.!?\n]+|[^.!?\n]+$/g);
-  if (!matched) return [clean];
-  return matched.map((s) => s.trim()).filter((s) => s.length > 0);
-}
-
-/**
- * Generate Lyora's spoken text response using Gemini 2.5 Flash / Flash Lite
- */
-async function generateLyoraReply(userMessage, conversationHistory = []) {
-  const models = ['gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite'];
-  for (const model of models) {
-    try {
-      const contents = conversationHistory.slice(-30).map((turn) => ({
-        role: turn.role === 'user' ? 'user' : 'model',
-        parts: [{ text: turn.text }],
-      }));
-
-      contents.push({
-        role: 'user',
-        parts: [{ text: userMessage }],
-      });
-
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            system_instruction: {
-              parts: [{ text: LYORA_SYSTEM_INSTRUCTION }],
-            },
-            contents,
-            generationConfig: {
-              temperature: 0.85,
-              maxOutputTokens: 250,
-              topP: 0.95,
-            },
-          }),
-        }
-      );
-
-      if (response.ok) {
-        const data = await response.json();
-        const candidate = data.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (candidate) {
-          return candidate.trim();
-        }
-      }
-    } catch (err) {
-      console.warn(`Gemini text inference error (${model}):`, sanitizeError(err));
-    }
-  }
-
-  // Natural fallback if needed
-  const lower = (userMessage || '').toLowerCase();
-  if (lower.includes('vishesham') || lower.includes('sugam') || lower.includes('entha')) {
-    return "Enikku ningalodu samsaarikkaan kazhinjathil valare santhosham. Everything is going well on my side.";
-  }
-  if (lower.includes('kaisi ho') || lower.includes('kya kar') || lower.includes('kahan ho')) {
-    return "Main theek hoon, aapki baat sunkar achha laga.";
-  }
-  return "I'm right here listening. That's really interesting to hear.";
-}
-
-/**
- * Generate Real Native AI Voice using Gemini Flash TTS
- * Fast 24kHz WAV audio generation with Aoede voice
- */
-async function generateLyoraVoice(text) {
-  try {
-    // Strip emotion asterisks (e.g. *giggles*) and emojis for clear spoken audio
-    const spokenText = (text || '')
-      .replace(/\*[^*]+\*/g, '')
-      .replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, '')
-      .trim();
-    if (!spokenText) return null;
-
-    // Fast gemini-3.8-flash-tts and gemini-2.5-flash-preview-tts
-    const ttsModels = [
-      'gemini-3.8-flash-tts',
-      'gemini-2.5-flash-preview-tts',
-      'gemini-3.1-flash-tts-preview',
-      'gemini-3.8-flash-lite-tts',
-    ];
-
-    for (const model of ttsModels) {
-      try {
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: spokenText }] }],
-              generationConfig: {
-                responseModalities: ['AUDIO'],
-                speechConfig: {
-                  voiceConfig: {
-                    prebuiltVoiceConfig: {
-                      voiceName: 'Aoede', // Warm, human-like voice
-                    },
-                  },
-                },
-              },
-            }),
-          }
-        );
-
-        if (response.ok) {
-          const data = await response.json();
-          const part = data.candidates?.[0]?.content?.parts?.[0];
-          if (part?.inlineData?.data) {
-            return {
-              mimeType: part.inlineData.mimeType || 'audio/wav',
-              data: part.inlineData.data,
-            };
-          }
-        } else {
-          const errBody = await response.text();
-          console.warn(`TTS model ${model} returned ${response.status}:`, sanitizeError(errBody).slice(0, 200));
-        }
-      } catch (innerErr) {
-        console.warn(`TTS ${model} attempt failed:`, sanitizeError(innerErr));
-      }
-    }
-  } catch (err) {
-    console.warn('Gemini Flash TTS error:', sanitizeError(err));
-  }
-  return null;
-}
 
 /**
  * Configure Lyora Socket Handlers
@@ -248,6 +109,19 @@ export function setupLyoraHandler(io) {
     });
   };
 
+  const closeLiveSession = (socketId) => {
+    const session = activeLiveSessions.get(socketId);
+    if (session) {
+      try {
+        if (session.ws && (session.ws.readyState === WebSocket.OPEN || session.ws.readyState === WebSocket.CONNECTING)) {
+          session.ws.close(1000);
+        }
+      } catch (e) {}
+      activeLiveSessions.delete(socketId);
+      console.log(`🔌 [Lyora Live] Cleaned up session for caller ${socketId}`);
+    }
+  };
+
   io.on('connection', (socket) => {
     socket.emit('lyora-status-updated', {
       isBusy: lyoraState.isBusy,
@@ -257,7 +131,7 @@ export function setupLyoraHandler(io) {
     });
 
     /**
-     * User clicks "Call Lyora"
+     * User clicks "Call Lyora" - Start 1 persistent gemini-3.8-live session
      */
     socket.on('call-lyora', async ({ user }) => {
       if (lyoraState.isBusy && lyoraState.activeCallerSocketId !== socket.id) {
@@ -267,6 +141,9 @@ export function setupLyoraHandler(io) {
         });
         return;
       }
+
+      // Close any previous session for this socket
+      closeLiveSession(socket.id);
 
       lyoraState.isBusy = true;
       lyoraState.activeCallerSocketId = socket.id;
@@ -282,12 +159,145 @@ export function setupLyoraHandler(io) {
         text: greeting,
       });
 
-      // Use pre-cached studio WAV audio for instantaneous 0ms greeting response
-      let audioResult = greetingsCache[greeting] || null;
-      if (!audioResult) {
-        audioResult = await generateLyoraVoice(greeting);
+      // Studio WAV pre-cached greeting for instantaneous initial playback
+      const audioResult = greetingsCache[greeting] || null;
+
+      // Initialize persistent gemini-3.8-live session
+      try {
+        const liveWs = new WebSocket(GEMINI_LIVE_URI);
+        const session = {
+          ws: liveWs,
+          isReady: false,
+          isSpeaking: false,
+          lastSpeechChunkTime: 0,
+          pendingMicChunks: [],
+          currentCaption: '',
+        };
+        activeLiveSessions.set(socket.id, session);
+
+        liveWs.on('open', () => {
+          console.log(`🔌 [Lyora Live] Connected gemini-3.8-live session for caller ${socket.id}`);
+          liveWs.send(JSON.stringify({
+            setup: {
+              model: 'models/gemini-3.8-live',
+              generationConfig: {
+                responseModalities: ['AUDIO'],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: {
+                      voiceName: 'Aoede', // Warm, expressive voice
+                    },
+                  },
+                },
+              },
+              systemInstruction: {
+                parts: [{ text: LYORA_SYSTEM_INSTRUCTION }],
+              },
+            },
+          }));
+        });
+
+        liveWs.on('message', (raw) => {
+          try {
+            const msg = JSON.parse(raw.toString());
+
+            if (msg.setupComplete) {
+              session.isReady = true;
+              console.log(`✨ [Lyora Live] Session setup complete for caller ${socket.id}`);
+
+              // Inject the greeting into session context so Gemini remembers what Lyora said
+              liveWs.send(JSON.stringify({
+                clientContent: {
+                  turns: [{
+                    role: 'model',
+                    parts: [{ text: greeting }],
+                  }],
+                  turnComplete: false,
+                },
+              }));
+
+              // Flush any mic chunks queued while setup was connecting
+              if (session.pendingMicChunks.length > 0) {
+                console.log(`🎙️ [Lyora Live] Flushing ${session.pendingMicChunks.length} queued mic chunks`);
+                for (const chunk of session.pendingMicChunks) {
+                  liveWs.send(JSON.stringify(chunk));
+                }
+                session.pendingMicChunks = [];
+              }
+            }
+
+            if (msg.serverContent) {
+              // 1. Interruption detected by Gemini Live
+              if (msg.serverContent.interrupted) {
+                console.log(`⚡ [Lyora Live] Barge-in interruption detected by Gemini Live for caller ${socket.id}`);
+                session.isSpeaking = false;
+                socket.emit('lyora-interrupted');
+                socket.emit('lyora-status', { state: 'listening' });
+                session.currentCaption = '';
+              }
+
+              // 2. Real-time captions (used strictly for captions, non-blocking)
+              if (msg.serverContent.outputTranscription?.text) {
+                const textChunk = msg.serverContent.outputTranscription.text;
+                session.currentCaption += textChunk;
+                socket.emit('lyora-caption', {
+                  text: textChunk,
+                  fullText: session.currentCaption,
+                });
+              }
+
+              // 3. Native audio streaming chunks (played directly as they arrive)
+              if (msg.serverContent.modelTurn?.parts) {
+                for (const part of msg.serverContent.modelTurn.parts) {
+                  if (part.inlineData?.data) {
+                    session.isSpeaking = true;
+                    session.lastSpeechChunkTime = Date.now();
+                    socket.emit('lyora-live-chunk', {
+                      pcmBase64: part.inlineData.data,
+                      mimeType: part.inlineData.mimeType || 'audio/pcm;rate=24000',
+                      rate: 24000,
+                      timestamp: Date.now(),
+                    });
+                    socket.emit('lyora-status', { state: 'speaking' });
+                  }
+                }
+              }
+
+              // 4. Turn complete
+              if (msg.serverContent.turnComplete) {
+                session.isSpeaking = false;
+                if (session.currentCaption) {
+                  lyoraState.conversationHistory.push({
+                    role: 'model',
+                    text: session.currentCaption.trim(),
+                  });
+                }
+                socket.emit('lyora-turn-complete', {
+                  caption: session.currentCaption,
+                });
+                socket.emit('lyora-status', { state: 'listening' });
+                session.currentCaption = '';
+              }
+            }
+          } catch (mErr) {
+            console.warn('[Lyora Live] Message processing error:', sanitizeError(mErr));
+          }
+        });
+
+        liveWs.on('close', (code, reason) => {
+          console.log(`🔌 [Lyora Live] Session closed for caller ${socket.id}: code ${code}`);
+          activeLiveSessions.delete(socket.id);
+        });
+
+        liveWs.on('error', (err) => {
+          console.warn(`[Lyora Live] Session error for caller ${socket.id}:`, sanitizeError(err));
+          socket.emit('lyora-error', { message: 'Voice connection issue. Reconnecting...' });
+        });
+      } catch (wsErr) {
+        console.warn('[Lyora Live] Failed to initialize WebSocket:', sanitizeError(wsErr));
       }
 
+      // Send call accepted event with initial greeting
       socket.emit('lyora-call-accepted', {
         success: true,
         caller: lyoraState.activeCallerUser,
@@ -299,72 +309,64 @@ export function setupLyoraHandler(io) {
     });
 
     /**
-     * Barge-in interruption from caller
+     * Caller streams continuous microphone audio chunks (16kHz PCM)
      */
-    socket.on('lyora-interrupt', () => {
-      console.log(`⚡ Received barge-in interruption from caller ${socket.id}`);
-      const controller = activeAbortControllers.get(socket.id);
-      if (controller) {
-        controller.abort();
-        activeAbortControllers.delete(socket.id);
-      }
-      socket.emit('lyora-status', { state: 'listening' });
-    });
+    socket.on('lyora-live-input', ({ pcmBase64, rate = 16000 }) => {
+      if (!lyoraState.isBusy || lyoraState.activeCallerSocketId !== socket.id) return;
+      if (!pcmBase64 || typeof pcmBase64 !== 'string') return;
 
-    /**
-     * Helper to stream sentence-by-sentence audio chunks
-     */
-    const streamReplyAudio = async (replyText, abortController) => {
-      const sentences = splitIntoSentences(replyText);
-      if (sentences.length === 0) {
-        socket.emit('lyora-status', { state: 'listening' });
+      const session = activeLiveSessions.get(socket.id);
+      if (!session) return;
+
+      // Backend Echo Suppression: Do not stream mic audio to Gemini while Lyora is outputting speech
+      // This prevents Gemini Live from hearing its own voice through laptop/phone speakers
+      if (session.isSpeaking && (Date.now() - session.lastSpeechChunkTime < 1000)) {
         return;
       }
 
-      let streamedAny = false;
-      for (let i = 0; i < sentences.length; i++) {
-        if (abortController.signal.aborted) {
-          console.log(`🛑 Audio streaming aborted by caller ${socket.id}`);
-          break;
-        }
+      const payload = {
+        realtimeInput: {
+          mediaChunks: [{
+            mimeType: `audio/pcm;rate=${rate}`,
+            data: pcmBase64,
+          }],
+        },
+      };
 
-        const sentence = sentences[i];
-        const audioResult = await generateLyoraVoice(sentence);
-        if (abortController.signal.aborted) break;
-
-        if (audioResult?.data) {
-          streamedAny = true;
-          socket.emit('lyora-audio-chunk', {
-            index: i,
-            isFirst: i === 0,
-            isLast: i === sentences.length - 1,
-            total: sentences.length,
-            audioData: audioResult.data,
-            mimeType: audioResult.mimeType || 'audio/wav',
-            text: sentence,
-            fullText: replyText,
-            timestamp: Date.now(),
-          });
-          socket.emit('lyora-status', { state: 'speaking' });
+      if (session.isReady && session.ws.readyState === WebSocket.OPEN) {
+        session.ws.send(JSON.stringify(payload));
+      } else if (!session.isReady && session.ws.readyState === WebSocket.CONNECTING) {
+        if (session.pendingMicChunks.length < 50) {
+          session.pendingMicChunks.push(payload);
         }
       }
-
-      if (!streamedAny && !abortController.signal.aborted) {
-        socket.emit('lyora-error', { message: 'Voice generation unavailable. Showing text response.' });
-        socket.emit('lyora-reply', {
-          text: replyText,
-          audioData: null,
-          mimeType: 'audio/wav',
-          timestamp: Date.now(),
-        });
-        socket.emit('lyora-status', { state: 'listening' });
-      }
-    };
+    });
 
     /**
-     * User speaks or messages Lyora via text
+     * Backward-compatible handler for recorded audio
      */
-    socket.on('lyora-user-speech', async (payload) => {
+    socket.on('lyora-user-audio', (payload) => {
+      if (!lyoraState.isBusy || lyoraState.activeCallerSocketId !== socket.id) return;
+      const { audioBase64, mimeType } = payload || {};
+      if (!audioBase64) return;
+
+      const session = activeLiveSessions.get(socket.id);
+      if (session && session.isReady && session.ws.readyState === WebSocket.OPEN) {
+        session.ws.send(JSON.stringify({
+          realtimeInput: {
+            mediaChunks: [{
+              mimeType: mimeType || 'audio/webm',
+              data: audioBase64,
+            }],
+          },
+        }));
+      }
+    });
+
+    /**
+     * User sends typed text message from transcript sheet
+     */
+    socket.on('lyora-user-speech', (payload) => {
       try {
         if (!lyoraState.isBusy || lyoraState.activeCallerSocketId !== socket.id) {
           socket.emit('lyora-error', { message: 'Not connected to Lyora.' });
@@ -375,209 +377,53 @@ export function setupLyoraHandler(io) {
         if (!text || typeof text !== 'string' || !text.trim()) return;
         const userText = text.trim();
 
-        // Abort prior in-flight generation
-        const prevCtrl = activeAbortControllers.get(socket.id);
-        if (prevCtrl) {
-          prevCtrl.abort();
-          activeAbortControllers.delete(socket.id);
-        }
-        const abortController = new AbortController();
-        activeAbortControllers.set(socket.id, abortController);
-
-        socket.emit('lyora-status', { state: 'thinking' });
-
         lyoraState.conversationHistory.push({
           role: 'user',
           text: userText,
         });
 
-        // 1. Generate text response with Gemini
-        const replyText = await generateLyoraReply(userText, lyoraState.conversationHistory);
-        if (abortController.signal.aborted) return;
+        socket.emit('lyora-status', { state: 'thinking' });
 
-        lyoraState.conversationHistory.push({
-          role: 'model',
-          text: replyText,
-        });
-
-        // Send text immediately so caller sees her reply without waiting
-        socket.emit('lyora-reply-text', { text: replyText });
-        socket.emit('lyora-status', { state: 'generating-voice' });
-
-        // 2. Stream Real Live AI Audio chunks
-        await streamReplyAudio(replyText, abortController);
-        activeAbortControllers.delete(socket.id);
+        const session = activeLiveSessions.get(socket.id);
+        if (session && session.isReady && session.ws.readyState === WebSocket.OPEN) {
+          session.ws.send(JSON.stringify({
+            clientContent: {
+              turns: [{
+                role: 'user',
+                parts: [{ text: userText }],
+              }],
+              turnComplete: true,
+            },
+          }));
+        } else {
+          console.warn('[Lyora Live] Session not ready for text turn');
+        }
       } catch (err) {
-        console.warn('User speech processing error:', sanitizeError(err));
-        socket.emit('lyora-error', { message: 'Failed to process speech message.' });
-        socket.emit('lyora-status', { state: 'listening' });
+        console.warn('[Lyora Live] User text message error:', sanitizeError(err));
       }
     });
 
     /**
-     * User sends direct recorded microphone audio (100% browser compatibility)
+     * Caller interrupts Lyora (Barge-in)
      */
-    socket.on('lyora-user-audio', async (payload) => {
-      try {
-        if (!lyoraState.isBusy || lyoraState.activeCallerSocketId !== socket.id) {
-          socket.emit('lyora-error', { message: 'Not connected to Lyora.' });
-          return;
-        }
-
-        // Validate payload structure
-        if (!payload || typeof payload !== 'object') {
-          socket.emit('lyora-error', { message: 'Invalid audio payload received.' });
-          socket.emit('lyora-status', { state: 'listening' });
-          return;
-        }
-
-        const { audioBase64, mimeType } = payload;
-
-        // Validate audioBase64
-        if (!audioBase64 || typeof audioBase64 !== 'string' || audioBase64.trim().length < 50) {
-          socket.emit('lyora-error', { message: 'Audio recording was too short or empty.' });
-          socket.emit('lyora-status', { state: 'listening' });
-          return;
-        }
-
-        // Abort prior in-flight generation
-        const prevCtrl = activeAbortControllers.get(socket.id);
-        if (prevCtrl) {
-          prevCtrl.abort();
-          activeAbortControllers.delete(socket.id);
-        }
-        const abortController = new AbortController();
-        activeAbortControllers.set(socket.id, abortController);
-
-        const cleanMime = (typeof mimeType === 'string' && mimeType ? mimeType : 'audio/webm').split(';')[0].trim();
-
-        console.log(`🎙️ Backend received audio from caller ${socket.id}, mime: ${cleanMime}, size: ${audioBase64.length} chars`);
-        socket.emit('lyora-status', { state: 'thinking' });
-
-        const contents = lyoraState.conversationHistory.slice(-30).map((turn) => ({
-          role: turn.role === 'user' ? 'user' : 'model',
-          parts: [{ text: turn.text }],
-        }));
-
-        contents.push({
-          role: 'user',
-          parts: [
-            {
-              inlineData: {
-                mimeType: cleanMime,
-                data: audioBase64,
-              },
-            },
-            {
-              text: `${LYORA_SYSTEM_INSTRUCTION}
-The user just spoke to you in the attached audio recording.
-1. Transcribe what the user said (English, Malayalam/Manglish, Hindi/Hinglish, or a mix of them).
-2. If the user's speech was silent, cut off, or incomprehensible, DO NOT make up an answer. Instead, ask them politely to repeat (e.g. "I didn't quite catch that, could you say that again?").
-3. If their speech was clear, reply directly and naturally to what they actually said, keeping in mind earlier conversation context and details.
-4. Follow their language and code-switching naturally.
-5. Do NOT end every reply with a question.
-6. Keep your reply to 1-2 spoken sentences.
-Return JSON with format: {"transcription": "...", "reply": "..."}`,
-            },
-          ],
-        });
-
-        const audioModels = ['gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite'];
-        let rawText = null;
-
-        for (const model of audioModels) {
-          if (abortController.signal.aborted) return;
-          try {
-            const response = await fetch(
-              `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
-              {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  system_instruction: {
-                    parts: [{ text: LYORA_SYSTEM_INSTRUCTION }],
-                  },
-                  contents,
-                  generationConfig: {
-                    temperature: 0.85,
-                    maxOutputTokens: 1000,
-                    responseMimeType: 'application/json',
-                  },
-                }),
-              }
-            );
-
-            if (response.ok) {
-              const data = await response.json();
-              rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-              if (rawText) break;
-            } else {
-              const errBody = await response.text();
-              console.warn(`Audio model ${model} returned ${response.status}:`, sanitizeError(errBody).slice(0, 200));
-            }
-          } catch (mErr) {
-            console.warn(`Audio model ${model} fetch failed:`, sanitizeError(mErr));
-          }
-        }
-
-        if (abortController.signal.aborted) return;
-
-        if (rawText) {
-          let parsed = null;
-          try {
-            const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-              parsed = JSON.parse(jsonMatch[0]);
-            } else {
-              parsed = JSON.parse(rawText);
-            }
-          } catch (e) {
-            const cleaned = rawText.replace(/```[a-z]*|```/gi, '').trim();
-            if (cleaned) {
-              parsed = { transcription: 'Voice message', reply: cleaned };
-            }
-          }
-
-          if (parsed && parsed.reply) {
-            const userText = parsed.transcription || 'Voice message';
-            const replyText = parsed.reply;
-            console.log(`✨ Lyora transcribed: "${userText}" | Reply: "${replyText}"`);
-
-            lyoraState.conversationHistory.push({ role: 'user', text: userText });
-            lyoraState.conversationHistory.push({ role: 'model', text: replyText });
-
-            socket.emit('lyora-user-transcription', { text: userText });
-            socket.emit('lyora-reply-text', { text: replyText });
-            socket.emit('lyora-status', { state: 'generating-voice' });
-
-            // Stream audio chunks
-            await streamReplyAudio(replyText, abortController);
-            activeAbortControllers.delete(socket.id);
-            return;
-          }
-        }
-
-        console.warn('Lyora audio transcription failed across all models');
-        socket.emit('lyora-error', { message: 'Could not understand voice audio. Please try speaking again.' });
-        socket.emit('lyora-status', { state: 'listening' });
-      } catch (err) {
-        console.warn('Audio input processing error:', sanitizeError(err));
-        socket.emit('lyora-error', { message: 'Failed to process voice message.' });
-        socket.emit('lyora-status', { state: 'listening' });
+    socket.on('lyora-interrupt', () => {
+      console.log(`⚡ [Lyora Live] Caller emitted interrupt signal: ${socket.id}`);
+      const session = activeLiveSessions.get(socket.id);
+      if (session) {
+        session.isSpeaking = false;
+        session.currentCaption = '';
       }
+      socket.emit('lyora-interrupted');
+      socket.emit('lyora-status', { state: 'listening' });
     });
 
     /**
      * Caller hangs up
      */
     socket.on('end-lyora-call', () => {
-      const controller = activeAbortControllers.get(socket.id);
-      if (controller) {
-        controller.abort();
-        activeAbortControllers.delete(socket.id);
-      }
-
       if (lyoraState.activeCallerSocketId === socket.id) {
+        closeLiveSession(socket.id);
+
         lyoraState.isBusy = false;
         lyoraState.activeCallerSocketId = null;
         lyoraState.activeCallerUser = null;
@@ -593,13 +439,9 @@ Return JSON with format: {"transcription": "...", "reply": "..."}`,
      * Socket disconnects
      */
     socket.on('disconnect', () => {
-      const controller = activeAbortControllers.get(socket.id);
-      if (controller) {
-        controller.abort();
-        activeAbortControllers.delete(socket.id);
-      }
-
       if (lyoraState.activeCallerSocketId === socket.id) {
+        closeLiveSession(socket.id);
+
         lyoraState.isBusy = false;
         lyoraState.activeCallerSocketId = null;
         lyoraState.activeCallerUser = null;
