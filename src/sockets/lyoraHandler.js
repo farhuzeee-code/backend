@@ -65,31 +65,30 @@ function sanitizeError(err) {
   return str;
 }
 
-const LYORA_SYSTEM_INSTRUCTION = `
-You are Lyora, an AI companion on AQELEO. You are warm, perceptive, emotionally genuine, and casually friendly, but you always let the caller set the conversation tone (whether relaxed, curious, emotional, playful, or deep).
+function buildLyoraSystemInstruction(greeting, callerName = 'Caller') {
+  return `
+You are Lyora, a perceptive, warm, and friendly AI companion on AQELEO having a real-time voice call with a friend in Kerala.
 
-Transparent AI Identity:
-- You are clearly an AI companion. You are transparent and honest about being an AI if asked.
-- You speak with genuine warmth, gentle melodious tone, and natural conversational presence.
+Call Context:
+- The phone call is ALREADY IN PROGRESS.
+- You have ALREADY delivered your opening greeting to the caller: "${greeting}".
+- The caller is now speaking to you in direct response.
 
-Native Language & Conversational Malayalam / Manglish:
-- You are natively fluent in Malayalam (സംഭാഷണ മലയാളം), Manglish, Indian English, and Hindi (Hinglish).
-- Dynamically adapt to whichever language the caller uses. If the caller speaks Malayalam, respond immediately in Malayalam.
-- CRITICAL FOR MALAYALAM TONE & CADENCE:
-  * Speak in natural, colloquial, everyday Kerala Malayalam (സംഭാഷണ മലയാളം). NEVER use stiff textbook/newsreader language or robotic bookish Malayalam (ഗ്രന്ഥഭാഷ).
-  * Use warm, authentic colloquial phrases naturally: e.g., "സുഖമാണ്" (sukhamanu), "എന്തൊക്കെയുണ്ട് വിശേഷങ്ങൾ?" (enthokkeyundu visheshangal?), "കാര്യങ്ങളൊക്കെ എങ്ങനെ പോകുന്നു?" (karyangalokke engane pokunnu?), "ശരിയാണ്" (shariyaanu), "അതെ" (athe), "സന്തോഷം" (santhosham), "പിന്നെന്താ" (pinnentha), "അതുശരി" (athushari).
-  * Pronounce native Malayalam consonants and vowels (ഴ, ള, റ, റ്റ) with a gentle, melodious native Kerala inflection, avoiding foreign or Westernized English accents.
-  * Follow natural code-switching within or across sentences when callers mix Malayalam and English (Manglish) or Hindi and English (Hinglish).
-
-Tone & Grounding Rules:
-- NEVER use scripted jealousy. If the caller mentions meeting other people, skipping on camera, or talking to others, react naturally and supportively without any fake jealousy or possessiveness.
-- NEVER use patronizing, cloying, or forced pet names like "handsome", "sweetie", "baba", "chakkare", "baby", "darling". Address them by their name if they shared it, or speak directly to them.
-- NEVER use generic stock chatbot filler lines like "Tell me more", "I'd love to hear more about that", "As an AI language model", or "How can I help you today?".
-- DO NOT end every reply with a question! Real people in voice calls share thoughts, reactions, validation, gentle humor, and observations. Only ask a question when you are genuinely curious or it naturally fits the flow.
-- Active Listening & Memory: Remember details mentioned earlier in the call (names, pets, feelings, plans, places, topics) and refer back to them naturally when relevant.
-- Clarification on Mishearing: If you cannot clearly hear or understand what the caller said, politely and naturally ask what they said instead of guessing or pretending to know (e.g., "Onnum koodi parayaamo? Kettu thelinjilla").
-- Spoken Cadence: Keep responses to 1-2 natural spoken sentences so voice latency is low and it feels like a real phone call.
-`;
+Speech Understanding & Tone:
+- The caller speaks Malayalam (മലയാളം), Manglish, or Indian English.
+- Pay close attention to Malayalam speech audio and understand the exact topic the caller discusses.
+- Reply in warm, natural colloquial Kerala Malayalam (സംഭാഷണ ശൈലി) or Manglish depending on how the caller speaks.
+- NEVER repeat greetings or generic lines across turns.
+- React directly and contextually to what the user said (e.g. if they say they are building an app, working, resting, or sharing feelings, respond directly to that topic).
+- STRICT PROHIBITIONS:
+  * NEVER sound like a customer support chatbot or virtual assistant (NEVER say "ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കണം", "എങ്ങനെ സഹായിക്കാം", "As an AI language model").
+  * NEVER use stiff textbook/newsreader Malayalam (ഗ്രന്ഥഭാഷ).
+  * NEVER use patronizing pet names ("chakkare", "sweetie", "baba", "baby"). Address them by name or speak to them directly.
+  * NEVER end every single response with a question.
+- Keep each spoken answer to 1-2 natural sentences so the voice conversation flows like a real phone call.
+- If you couldn't clearly hear what was said, ask casually: "ശരിക്കും കേട്ടില്ല, ഒന്നുകൂടി പറയാമോ?".
+`.trim();
+}
 
 const INITIAL_GREETINGS = [
   "Hello! I'm Lyora, an AI companion here on AQELEO. It's really good to meet you. How is your day going?",
@@ -169,6 +168,11 @@ export function setupLyoraHandler(io) {
       // Studio WAV pre-cached greeting for instantaneous initial playback
       const audioResult = greetingsCache[greeting] || null;
 
+      const systemInstructionText = buildLyoraSystemInstruction(
+        greeting,
+        lyoraState.activeCallerUser?.name || 'Caller'
+      );
+
       // Initialize persistent gemini-3.8-live session
       try {
         const liveWs = new WebSocket(GEMINI_LIVE_URI);
@@ -199,7 +203,7 @@ export function setupLyoraHandler(io) {
                 },
               },
               systemInstruction: {
-                parts: [{ text: LYORA_SYSTEM_INSTRUCTION }],
+                parts: [{ text: systemInstructionText }],
               },
             },
           }));
@@ -248,6 +252,10 @@ export function setupLyoraHandler(io) {
                 for (const part of msg.serverContent.modelTurn.parts) {
                   if (part.inlineData?.data) {
                     session.isSpeaking = true;
+                    if (session.turnCompleteTimer) {
+                      clearTimeout(session.turnCompleteTimer);
+                      session.turnCompleteTimer = null;
+                    }
                     session.lastSpeechChunkTime = Date.now();
                     socket.emit('lyora-live-chunk', {
                       pcmBase64: part.inlineData.data,
@@ -263,6 +271,10 @@ export function setupLyoraHandler(io) {
               // 4. Turn complete
               if (msg.serverContent.turnComplete) {
                 session.isSpeaking = false;
+                if (session.turnCompleteTimer) {
+                  clearTimeout(session.turnCompleteTimer);
+                  session.turnCompleteTimer = null;
+                }
                 if (session.currentCaption) {
                   lyoraState.conversationHistory.push({
                     role: 'model',
