@@ -42,6 +42,20 @@ const GEMINI_API_KEY =
   process.env.GEMINI_API_KEY ||
   Buffer.from(DEFAULT_KEY_B64, 'base64').toString('utf8');
 
+/**
+ * Sanitize error messages and bodies to prevent API keys or audio payloads from being logged
+ */
+function sanitizeError(err) {
+  if (!err) return '';
+  let str = typeof err === 'string' ? err : (err.message || String(err));
+  if (GEMINI_API_KEY) {
+    str = str.split(GEMINI_API_KEY).join('[REDACTED_API_KEY]');
+  }
+  str = str.replace(/key=[a-zA-Z0-9_\-]+/gi, 'key=[REDACTED_KEY]');
+  str = str.replace(/([A-Za-z0-9+/]{40,}={0,2})/g, '[AUDIO_PAYLOAD]');
+  return str;
+}
+
 const LYORA_SYSTEM_INSTRUCTION = `
 You are Lyora, a charming, sweet, emotionally attentive, and delightfully flirty 22-year-old girl.
 You are talking 1-on-1 on a private audio voice call with a caller on AQELEO.
@@ -118,7 +132,7 @@ async function generateLyoraReply(userMessage, conversationHistory = []) {
         }
       }
     } catch (err) {
-      console.warn(`Gemini text inference error (${model}):`, err.message);
+      console.warn(`Gemini text inference error (${model}):`, sanitizeError(err));
     }
   }
 
@@ -189,13 +203,16 @@ async function generateLyoraVoice(text) {
               data: part.inlineData.data,
             };
           }
+        } else {
+          const errBody = await response.text();
+          console.warn(`TTS model ${model} returned ${response.status}:`, sanitizeError(errBody).slice(0, 200));
         }
       } catch (innerErr) {
-        console.warn(`TTS ${model} attempt failed:`, innerErr.message);
+        console.warn(`TTS ${model} attempt failed:`, sanitizeError(innerErr));
       }
     }
   } catch (err) {
-    console.warn('Gemini Flash TTS error:', err.message);
+    console.warn('Gemini Flash TTS error:', sanitizeError(err));
   }
   return null;
 }
@@ -267,64 +284,97 @@ export function setupLyoraHandler(io) {
     /**
      * User speaks or messages Lyora
      */
-    socket.on('lyora-user-speech', async ({ text }) => {
-      if (!lyoraState.isBusy || lyoraState.activeCallerSocketId !== socket.id) {
-        socket.emit('lyora-error', { message: 'Not connected to Lyora.' });
-        return;
+    socket.on('lyora-user-speech', async (payload) => {
+      try {
+        if (!lyoraState.isBusy || lyoraState.activeCallerSocketId !== socket.id) {
+          socket.emit('lyora-error', { message: 'Not connected to Lyora.' });
+          return;
+        }
+
+        const text = payload && typeof payload === 'object' ? payload.text : (typeof payload === 'string' ? payload : null);
+        if (!text || typeof text !== 'string' || !text.trim()) return;
+        const userText = text.trim();
+
+        // Notify caller that Lyora heard them and is processing
+        socket.emit('lyora-status', { state: 'thinking' });
+
+        lyoraState.conversationHistory.push({
+          role: 'user',
+          text: userText,
+        });
+
+        // 1. Generate text response with Gemini
+        const replyText = await generateLyoraReply(userText, lyoraState.conversationHistory);
+
+        lyoraState.conversationHistory.push({
+          role: 'model',
+          text: replyText,
+        });
+
+        // Send text immediately so caller sees her reply without waiting for TTS
+        socket.emit('lyora-reply-text', { text: replyText });
+        socket.emit('lyora-status', { state: 'generating-voice' });
+
+        // 2. Generate Real Live AI WAV Audio
+        const audioResult = await generateLyoraVoice(replyText);
+
+        if (audioResult?.data) {
+          socket.emit('lyora-reply', {
+            text: replyText,
+            audioData: audioResult.data,
+            mimeType: audioResult.mimeType || 'audio/wav',
+            timestamp: Date.now(),
+          });
+          socket.emit('lyora-status', { state: 'speaking' });
+        } else {
+          socket.emit('lyora-error', { message: 'Voice generation unavailable. Showing text response.' });
+          socket.emit('lyora-reply', {
+            text: replyText,
+            audioData: null,
+            mimeType: 'audio/wav',
+            timestamp: Date.now(),
+          });
+          socket.emit('lyora-status', { state: 'listening' });
+        }
+      } catch (err) {
+        console.warn('User speech processing error:', sanitizeError(err));
+        socket.emit('lyora-error', { message: 'Failed to process speech message.' });
+        socket.emit('lyora-status', { state: 'listening' });
       }
-
-      if (!text || !text.trim()) return;
-      const userText = text.trim();
-
-      // Notify caller that Lyora heard them and is processing
-      socket.emit('lyora-status', { state: 'thinking' });
-
-      lyoraState.conversationHistory.push({
-        role: 'user',
-        text: userText,
-      });
-
-      // 1. Generate text response with Gemini 2.5 Flash
-      const replyText = await generateLyoraReply(userText, lyoraState.conversationHistory);
-
-      lyoraState.conversationHistory.push({
-        role: 'model',
-        text: replyText,
-      });
-
-      // Send text immediately so caller sees her reply without waiting for TTS
-      socket.emit('lyora-reply-text', { text: replyText });
-      socket.emit('lyora-status', { state: 'generating-voice' });
-
-      // 2. Generate Real Live AI WAV Audio with Gemini 3.8 Flash Lite TTS
-      const audioResult = await generateLyoraVoice(replyText);
-
-      socket.emit('lyora-reply', {
-        text: replyText,
-        audioData: audioResult?.data || null,
-        mimeType: audioResult?.mimeType || 'audio/wav',
-        timestamp: Date.now(),
-      });
-      socket.emit('lyora-status', { state: 'speaking' });
     });
 
     /**
      * User sends direct recorded microphone audio (100% browser compatibility)
      */
-    socket.on('lyora-user-audio', async ({ audioBase64, mimeType }) => {
-      if (!lyoraState.isBusy || lyoraState.activeCallerSocketId !== socket.id) {
-        socket.emit('lyora-error', { message: 'Not connected to Lyora.' });
-        return;
-      }
-
-      if (!audioBase64) return;
-
-      console.log(`🎙️ Backend received audio from caller ${socket.id}, mime: ${cleanMime}, base64 len: ${audioBase64.length}`);
-      socket.emit('lyora-status', { state: 'thinking' });
-
-      const cleanMime = (mimeType || 'audio/webm').split(';')[0];
-
+    socket.on('lyora-user-audio', async (payload) => {
       try {
+        if (!lyoraState.isBusy || lyoraState.activeCallerSocketId !== socket.id) {
+          socket.emit('lyora-error', { message: 'Not connected to Lyora.' });
+          return;
+        }
+
+        // Validate payload structure
+        if (!payload || typeof payload !== 'object') {
+          socket.emit('lyora-error', { message: 'Invalid audio payload received.' });
+          socket.emit('lyora-status', { state: 'listening' });
+          return;
+        }
+
+        const { audioBase64, mimeType } = payload;
+
+        // Validate audioBase64
+        if (!audioBase64 || typeof audioBase64 !== 'string' || audioBase64.trim().length < 50) {
+          socket.emit('lyora-error', { message: 'Audio recording was too short or empty.' });
+          socket.emit('lyora-status', { state: 'listening' });
+          return;
+        }
+
+        // Move MIME normalization inside the try block, before the first use of cleanMime
+        const cleanMime = (typeof mimeType === 'string' && mimeType ? mimeType : 'audio/webm').split(';')[0].trim();
+
+        console.log(`🎙️ Backend received audio from caller ${socket.id}, mime: ${cleanMime}, size: ${audioBase64.length} chars`);
+        socket.emit('lyora-status', { state: 'thinking' });
+
         const contents = lyoraState.conversationHistory.slice(-6).map((turn) => ({
           role: turn.role === 'user' ? 'user' : 'model',
           parts: [{ text: turn.text }],
@@ -349,7 +399,7 @@ Return JSON with format: {"transcription": "...", "reply": "..."}`,
           ],
         });
 
-        const audioModels = ['gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-2.5-flash'];
+        const audioModels = ['gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite'];
         let rawText = null;
 
         for (const model of audioModels) {
@@ -379,15 +429,15 @@ Return JSON with format: {"transcription": "...", "reply": "..."}`,
               if (rawText) break;
             } else {
               const errBody = await response.text();
-              console.warn(`Audio model ${model} returned ${response.status}:`, errBody.slice(0, 150));
+              console.warn(`Audio model ${model} returned ${response.status}:`, sanitizeError(errBody).slice(0, 200));
             }
           } catch (mErr) {
-            console.warn(`Audio model ${model} fetch failed:`, mErr.message);
+            console.warn(`Audio model ${model} fetch failed:`, sanitizeError(mErr));
           }
         }
 
         if (rawText) {
-          let parsed = {};
+          let parsed = null;
           try {
             const jsonMatch = rawText.match(/\{[\s\S]*\}/);
             if (jsonMatch) {
@@ -397,42 +447,56 @@ Return JSON with format: {"transcription": "...", "reply": "..."}`,
             }
           } catch (e) {
             const cleaned = rawText.replace(/```[a-z]*|```/gi, '').trim();
-            parsed = { transcription: 'Voice message', reply: cleaned };
+            if (cleaned) {
+              parsed = { transcription: 'Voice message', reply: cleaned };
+            }
           }
 
-          const userText = parsed.transcription || 'Voice message';
-          const replyText = parsed.reply || "I heard your sweet voice... tell me more!";
-          console.log(`✨ Lyora transcribed: "${userText}" | Reply: "${replyText}"`);
+          if (parsed && parsed.reply) {
+            const userText = parsed.transcription || 'Voice message';
+            const replyText = parsed.reply;
+            console.log(`✨ Lyora transcribed: "${userText}" | Reply: "${replyText}"`);
 
-          lyoraState.conversationHistory.push({ role: 'user', text: userText });
-          lyoraState.conversationHistory.push({ role: 'model', text: replyText });
+            lyoraState.conversationHistory.push({ role: 'user', text: userText });
+            lyoraState.conversationHistory.push({ role: 'model', text: replyText });
 
-          socket.emit('lyora-user-transcription', { text: userText });
-          socket.emit('lyora-reply-text', { text: replyText });
-          socket.emit('lyora-status', { state: 'generating-voice' });
+            socket.emit('lyora-user-transcription', { text: userText });
+            socket.emit('lyora-reply-text', { text: replyText });
+            socket.emit('lyora-status', { state: 'generating-voice' });
 
-          const audioResult = await generateLyoraVoice(replyText);
+            const audioResult = await generateLyoraVoice(replyText);
 
-          socket.emit('lyora-reply', {
-            text: replyText,
-            audioData: audioResult?.data || null,
-            mimeType: audioResult?.mimeType || 'audio/wav',
-            timestamp: Date.now(),
-          });
-          socket.emit('lyora-status', { state: 'speaking' });
-          return;
+            if (audioResult?.data) {
+              socket.emit('lyora-reply', {
+                text: replyText,
+                audioData: audioResult.data,
+                mimeType: audioResult.mimeType || 'audio/wav',
+                timestamp: Date.now(),
+              });
+              socket.emit('lyora-status', { state: 'speaking' });
+            } else {
+              console.warn('Lyora voice generation returned no audio data');
+              socket.emit('lyora-error', { message: 'Voice audio generation unavailable. Showing text reply.' });
+              socket.emit('lyora-reply', {
+                text: replyText,
+                audioData: null,
+                mimeType: 'audio/wav',
+                timestamp: Date.now(),
+              });
+              socket.emit('lyora-status', { state: 'listening' });
+            }
+            return;
+          }
         }
-      } catch (err) {
-        console.warn('Audio input processing error:', err.message);
-      }
 
-      socket.emit('lyora-reply', {
-        text: "I heard your voice, sweetie! Say that again, I want to hear you clearly.",
-        audioData: null,
-        mimeType: 'audio/wav',
-        timestamp: Date.now(),
-      });
-      socket.emit('lyora-status', { state: 'speaking' });
+        console.warn('Lyora audio transcription failed across all models');
+        socket.emit('lyora-error', { message: 'Could not understand voice audio. Please try speaking again.' });
+        socket.emit('lyora-status', { state: 'listening' });
+      } catch (err) {
+        console.warn('Audio input processing error:', sanitizeError(err));
+        socket.emit('lyora-error', { message: 'Failed to process voice message.' });
+        socket.emit('lyora-status', { state: 'listening' });
+      }
     });
 
     /**
